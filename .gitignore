@@ -1,0 +1,5 @@
+.idea/
+build/
+
+redis-walker
+redis-walker.log
