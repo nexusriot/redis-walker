@@ -247,6 +247,7 @@ func (c *Controller) setInput() {
 		}
 		return event
 	})
+
 	c.view.List.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
 		case tcell.KeyCtrlN:
@@ -261,12 +262,21 @@ func (c *Controller) setInput() {
 			return c.jump()
 		case tcell.KeyCtrlH:
 			help := c.view.NewHotkeysModal()
+
+			// Wrap in modal layout
+			modal := c.view.ModalEdit(help, 70, 18)
+
+			// Close on any key, and restore focus to the list
 			help.SetInputCapture(func(_ *tcell.EventKey) *tcell.EventKey {
 				c.view.Pages.RemovePage("modal-help")
+				c.view.App.SetFocus(c.view.List)
 				return nil
 			})
-			c.view.Pages.AddPage("modal-help", c.view.ModalEdit(help, 70, 18), true, true)
+
+			c.view.Pages.AddPage("modal-help", modal, true, true)
+			c.view.App.SetFocus(help)
 			return nil
+
 		case tcell.KeyBackspace2:
 			c.Up()
 			return nil
