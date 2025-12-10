@@ -54,7 +54,7 @@ func NewView() *View {
 
 	frame := tview.NewFrame(pages)
 	frame.AddText(
-		"[::b][↓,↑][::-] Down/Up  [::b][Enter/Backspace][::-]Open/Up [::b][Ctrl+N][::-]New(Create) [::b][Del][::-]Delete [::b][Ctrl+E][::-]Edit [::b][/,Ctrl+S][::-]Search [::b][Ctrl+J][::-]Jump [::b][Ctrl+H][::-]Hotkeys [::b][Ctrl+Q][::-]Quit",
+		"[::b][↓,↑][::-] Down/Up  [::b][Enter/Backspace][::-]Open/Up [::b][Ctrl+N][::-]New(Create) [::b][Del[][::-]Delete [::b][Ctrl+E][::-]Edit [::b][/,Ctrl+S][::-]Search [::b][Ctrl+J][::-]Jump [::b][F1/?][::-]Hotkeys [::b][Ctrl+Q][::-]Quit",
 		false,
 		tview.AlignCenter,
 		tcell.ColorWhite,
@@ -76,18 +76,33 @@ func NewView() *View {
 
 func (v *View) NewCreateForm(header string) *tview.Form {
 	form := tview.NewForm().
-		AddInputField("Key name", "", 60, nil, nil).
-		AddInputField("Value", "", 60, nil, nil)
+		AddInputField("Key name", "", 32, nil, nil).
+		AddInputField("Value", "", 32, nil, nil)
+
 	form.AddCheckbox("Is a Directory", false, func(checked bool) {})
-	form.SetBorder(true)
-	form.SetTitle(header)
+
+	// Style & layout tweaks
+	form.SetBorder(true).
+		SetTitle(header).
+		SetTitleAlign(tview.AlignLeft)
+
+	form.SetBorderPadding(1, 1, 2, 2)
+
+	form.SetLabelColor(tcell.ColorYellow)
+	form.SetFieldTextColor(tcell.ColorWhite)
+	form.SetFieldBackgroundColor(tcell.ColorDefault)
+	form.SetButtonsAlign(tview.AlignCenter)
+
+	// Esc closes the modal
 	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
 		case tcell.KeyEsc:
 			v.Pages.RemovePage("modal")
+			return nil
 		}
 		return event
 	})
+
 	return form
 }
 
@@ -149,7 +164,7 @@ func (v *View) NewHotkeysModal() *tview.TextView {
 		  Ctrl+S        Save
 		  Esc/Ctrl+Q    Cancel/Cancel+Quit
 		[::b]Misc[::-]
-		  Ctrl+H        This help
+		  F1 or ?   This help
 		  Ctrl+Q        Quit
 		
 		[dim]Press any key to close.[-]
