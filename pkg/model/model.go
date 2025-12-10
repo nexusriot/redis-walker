@@ -23,13 +23,17 @@ type Node struct {
 }
 
 // NewModel creates a new Redis-backed model.
-func NewModel(host, port string, db int, excludePrefixes []string) (*Model, error) {
+func NewModel(host, port string, db int, username, password string, excludePrefixes []string) (*Model, error) {
 	addr := fmt.Sprintf("%s:%s", host, port)
-	rdb := redis.NewClient(&redis.Options{
-		Addr: addr,
-		DB:   db,
-		// TODO: extend with Password & Username
-	})
+
+	opts := &redis.Options{
+		Addr:     addr,
+		DB:       db,
+		Username: username, // optional ACL user
+		Password: password, // optional password
+	}
+
+	rdb := redis.NewClient(opts)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()

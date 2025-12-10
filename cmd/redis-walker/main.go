@@ -42,17 +42,21 @@ func (f *boolFlag) Set(s string) error {
 
 func main() {
 	var (
-		hostFlag    = &stringFlag{value: "127.0.0.1"}
-		portFlag    = &stringFlag{value: "6379"}
-		dbFlag      = &stringFlag{value: "0"}
-		debugFlag   = &boolFlag{value: false}
-		excludeFlag = &stringFlag{value: ""} // comma-separated prefixes
+		hostFlag     = &stringFlag{value: "127.0.0.1"}
+		portFlag     = &stringFlag{value: "6379"}
+		dbFlag       = &stringFlag{value: "0"}
+		debugFlag    = &boolFlag{value: false}
+		usernameFlag = &stringFlag{value: ""} // Redis ACL username
+		passwordFlag = &stringFlag{value: ""} // Redis password
+		excludeFlag  = &stringFlag{value: ""} // comma-separated prefixes
 	)
 
 	flag.Var(hostFlag, "host", "redis host (default: 127.0.0.1)")
 	flag.Var(portFlag, "port", "redis port (default: 6379)")
 	flag.Var(dbFlag, "db", "redis database index (default: 0)")
 	flag.Var(debugFlag, "debug", "enable debug logging (true/false)")
+	flag.Var(usernameFlag, "username", "redis username (ACL user, optional)")
+	flag.Var(passwordFlag, "password", "redis password (optional)")
 	flag.Var(excludeFlag, "exclude-prefixes",
 		"comma-separated list of key prefixes to exclude (e.g. '/pcp:,/metrics:')")
 	flag.Parse()
@@ -104,6 +108,16 @@ func main() {
 		debug = *cfg.Debug
 	}
 
+	// Resolve username/password
+	username := usernameFlag.value
+	if !usernameFlag.set && cfg.Username != "" {
+		username = cfg.Username
+	}
+	password := passwordFlag.value
+	if !passwordFlag.set && cfg.Password != "" {
+		password = cfg.Password
+	}
+
 	// Resolve exclude prefixes
 	var excludePrefixes []string
 	if excludeFlag.set {
@@ -123,11 +137,13 @@ func main() {
 		"port":             port,
 		"db":               dbIdx,
 		"debug":            debug,
+		"username":         username,
+		"auth_enabled":     password != "",
 		"exclude_prefixes": excludePrefixes,
 		"config_path":      config.DefaultConfigPath,
 	}).Info("Starting redis-walker")
 
-	m, err := model.NewModel(host, port, dbIdx, excludePrefixes)
+	m, err := model.NewModel(host, port, dbIdx, username, password, excludePrefixes)
 	if err != nil {
 		log.WithError(err).Error("failed to create Redis model")
 		os.Exit(1)

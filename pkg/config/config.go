@@ -13,7 +13,9 @@ type Config struct {
 	Port            string   `json:"port"`
 	DB              *int     `json:"db"`
 	Debug           *bool    `json:"debug"`
-	ExcludePrefixes []string `json:"exclude_prefixes"`
+	Username        string   `json:"username"`         // optional Redis ACL username
+	Password        string   `json:"password"`         // optional Redis password
+	ExcludePrefixes []string `json:"exclude_prefixes"` // key prefixes to hide
 }
 
 const DefaultConfigPath = "/etc/redis-walker/config.json"

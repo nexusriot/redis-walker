@@ -31,7 +31,7 @@ func splitFunc(r rune) bool { return r == '/' }
 func NewController(m *model.Model, host, port string, db int, debug bool) *Controller {
 	v := view.NewView()
 	v.Frame.AddText(
-		fmt.Sprintf("Redis-walker (on %s:%s, db=%d)", host, port, db),
+		fmt.Sprintf("Redis-walker v.0.0.2 (preview) (on %s:%s, db=%d)", host, port, db),
 		true, tview.AlignCenter, tcell.ColorGreen,
 	)
 
@@ -238,6 +238,24 @@ func (c *Controller) getPosition(element string, slice []string) int {
 	return 0
 }
 
+// showHelp opens the hotkeys modal and wires closing + focus restore.
+func (c *Controller) showHelp() *tcell.EventKey {
+	help := c.view.NewHotkeysModal()
+
+	modal := c.view.ModalEdit(help, 70, 18)
+
+	// Close on any key and restore focus to the list
+	help.SetInputCapture(func(_ *tcell.EventKey) *tcell.EventKey {
+		c.view.Pages.RemovePage("modal-help")
+		c.view.App.SetFocus(c.view.List)
+		return nil
+	})
+
+	c.view.Pages.AddPage("modal-help", modal, true, true)
+	c.view.App.SetFocus(help)
+	return nil
+}
+
 func (c *Controller) setInput() {
 	c.view.App.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
@@ -247,6 +265,7 @@ func (c *Controller) setInput() {
 		}
 		return event
 	})
+
 	c.view.List.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
 		case tcell.KeyCtrlN:
@@ -259,21 +278,18 @@ func (c *Controller) setInput() {
 			return c.search()
 		case tcell.KeyCtrlJ:
 			return c.jump()
-		case tcell.KeyCtrlH:
-			help := c.view.NewHotkeysModal()
-			help.SetInputCapture(func(_ *tcell.EventKey) *tcell.EventKey {
-				c.view.Pages.RemovePage("modal-help")
-				return nil
-			})
-			c.view.Pages.AddPage("modal-help", c.view.ModalEdit(help, 70, 18), true, true)
-			return nil
-		case tcell.KeyBackspace2:
+		case tcell.KeyF1:
+			return c.showHelp()
+		case tcell.KeyBackspace, tcell.KeyBackspace2:
 			c.Up()
 			return nil
 		case tcell.KeyRune:
 			switch event.Rune() {
 			case '/':
 				return c.search()
+			case '?':
+				// Reliable help key
+				return c.showHelp()
 			}
 		}
 		return event
@@ -444,7 +460,7 @@ func (c *Controller) create() *tcell.EventKey {
 	createForm.AddButton("Quit", func() {
 		c.view.Pages.RemovePage("modal")
 	})
-	c.view.Pages.AddPage("modal", c.view.ModalEdit(createForm, 60, 11), true, true)
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(createForm, 55, 11), true, true)
 	return nil
 }
 
