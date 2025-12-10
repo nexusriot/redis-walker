@@ -12,7 +12,8 @@ import (
 )
 
 type Model struct {
-	rdb *redis.Client
+	rdb     *redis.Client
+	exclude []string
 }
 
 type Node struct {
@@ -22,7 +23,7 @@ type Node struct {
 }
 
 // NewModel creates a new Redis-backed model.
-func NewModel(host, port string, db int) (*Model, error) {
+func NewModel(host, port string, db int, excludePrefixes []string) (*Model, error) {
 	addr := fmt.Sprintf("%s:%s", host, port)
 	rdb := redis.NewClient(&redis.Options{
 		Addr: addr,
@@ -37,7 +38,21 @@ func NewModel(host, port string, db int) (*Model, error) {
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		return nil, fmt.Errorf("redis ping failed: %w", err)
 	}
-	return &Model{rdb: rdb}, nil
+
+	// Normalize exclude prefixes
+	normEx := make([]string, 0, len(excludePrefixes))
+	for _, p := range excludePrefixes {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		normEx = append(normEx, normPath(p))
+	}
+
+	return &Model{
+		rdb:     rdb,
+		exclude: normEx,
+	}, nil
 }
 
 // Public API (same as etcd model, minus protocols)
@@ -102,6 +117,19 @@ func baseOf(p string) string {
 	return p[i+1:]
 }
 
+func (m *Model) shouldExclude(key string) bool {
+	if len(m.exclude) == 0 {
+		return false
+	}
+	k := normPath(key)
+	for _, p := range m.exclude {
+		if strings.HasPrefix(k, p) {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *Model) scanKeysWithPrefix(ctx context.Context, prefix string) ([]string, error) {
 	var (
 		cursor uint64
@@ -113,7 +141,18 @@ func (m *Model) scanKeysWithPrefix(ctx context.Context, prefix string) ([]string
 		if err != nil {
 			return nil, err
 		}
-		all = append(all, keys...)
+		for _, k := range keys {
+			if m.shouldExclude(k) {
+				log.WithFields(log.Fields{
+					"op":   "scan",
+					"key":  k,
+					"pfx":  prefix,
+					"info": "excluded by prefix",
+				}).Debug("redis scan skipped key")
+				continue
+			}
+			all = append(all, k)
+		}
 		if next == 0 {
 			break
 		}
@@ -412,7 +451,7 @@ func (m *Model) get(key string) (*Node, error) {
 			return &Node{
 				Name:  k,
 				IsDir: false,
-				Value: "", // could later show "<non-string>" if you want
+				Value: "",
 			}, nil
 		}
 		return nil, err
