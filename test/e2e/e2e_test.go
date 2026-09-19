@@ -43,9 +43,7 @@ func TestBrowseTree(t *testing.T) {
 	a.waitFor("the cfg folder", func() bool { return a.ctrl.CurrentPrefix() == "app/cfg/" })
 	a.press(tcell.KeyBackspace2)
 	a.waitFor("the app folder again", func() bool { return a.ctrl.CurrentPrefix() == "app/" })
-	if got := a.currentItem(); got != "📁 cfg/" {
-		t.Fatalf("the cursor did not return to the folder we came from: %q", got)
-	}
+	a.waitForCursor("cfg/")
 }
 
 func TestDetailsPaneShowsValue(t *testing.T) {
@@ -81,9 +79,7 @@ func TestCreateKeyThroughTheDialog(t *testing.T) {
 	if a.exists("/created") {
 		t.Fatal("the key was written with a spurious leading slash")
 	}
-	if got := a.currentItem(); got != "   created" {
-		t.Fatalf("the cursor is on %q, want the new key", got)
-	}
+	a.waitForCursor("created")
 }
 
 func TestCreateFolderThroughTheDialog(t *testing.T) {
@@ -117,9 +113,7 @@ func TestEditValueThroughTheEditor(t *testing.T) {
 	a.press(tcell.KeyCtrlS)
 
 	a.waitFor("the edited value", func() bool { return a.get("key") == "EDITED-original" })
-	if got := a.currentItem(); got != "   key" {
-		t.Fatalf("the cursor is on %q after saving", got)
-	}
+	a.waitForCursor("key")
 	a.waitFor("the details pane to refresh", func() bool {
 		return strings.Contains(a.view.Details.GetText(true), "EDITED-original")
 	})
@@ -241,7 +235,7 @@ func TestRenameFolderThroughTheDialog(t *testing.T) {
 	a.waitFor("the rename dialog", func() bool { return a.frontPageNow() == "modal" })
 	// Clear the prefilled name and type the new one.
 	for i := 0; i < len("old"); i++ {
-		a.screen.InjectKey(tcell.KeyBackspace2, 0, tcell.ModNone)
+		a.Key(tcell.KeyBackspace2, 0)
 	}
 	a.settle()
 	a.typeText("fresh")
@@ -277,7 +271,7 @@ func TestRenameFolderPreservesNonStringValues(t *testing.T) {
 	a.press(tcell.KeyCtrlE)
 	a.waitFor("the rename dialog", func() bool { return a.frontPageNow() == "modal" })
 	for i := 0; i < len("src"); i++ {
-		a.screen.InjectKey(tcell.KeyBackspace2, 0, tcell.ModNone)
+		a.Key(tcell.KeyBackspace2, 0)
 	}
 	a.settle()
 	a.typeText("dst")
@@ -305,9 +299,7 @@ func TestJumpToAKey(t *testing.T) {
 	a.press(tcell.KeyEnter)
 
 	a.waitFor("the target folder", func() bool { return a.ctrl.CurrentPrefix() == "deep/nested/" })
-	if got := a.currentItem(); got != "   leaf" {
-		t.Fatalf("the cursor is on %q", got)
-	}
+	a.waitForCursor("leaf")
 }
 
 func TestJumpToAMissingKeyShowsAnError(t *testing.T) {
@@ -393,7 +385,7 @@ func TestExcludePrefixesHideKeys(t *testing.T) {
 	}
 	defer m.Close()
 
-	l, err := m.Ls("")
+	l, err := m.Ls(ctx(t), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -423,14 +415,14 @@ func TestAuthentication(t *testing.T) {
 	}
 	defer m.Close()
 
-	if err := m.Set("authenticated", "yes"); err != nil {
+	if err := m.Set(ctx(t), "authenticated", "yes"); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	n, err := m.Get("authenticated")
+	n, err := m.Get(ctx(t), "authenticated")
 	if err != nil || n.Value != "yes" {
 		t.Fatalf("Get = %+v, %v", n, err)
 	}
-	if err := m.Del("authenticated"); err != nil {
+	if err := m.Del(ctx(t), "authenticated"); err != nil {
 		t.Fatalf("Del: %v", err)
 	}
 }
@@ -455,13 +447,13 @@ func TestSelectedDatabaseIsIsolated(t *testing.T) {
 	if err := raw1.FlushDB(ctx(t)).Err(); err != nil {
 		t.Fatal(err)
 	}
-	if err := db1.Set("only-in-db1", "v"); err != nil {
+	if err := db1.Set(ctx(t), "only-in-db1", "v"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db0.Get("only-in-db1"); err == nil {
+	if _, err := db0.Get(ctx(t), "only-in-db1"); err == nil {
 		t.Fatal("database 0 sees a key written to database 1")
 	}
-	if err := db1.Del("only-in-db1"); err != nil {
+	if err := db1.Del(ctx(t), "only-in-db1"); err != nil {
 		t.Fatal(err)
 	}
 }

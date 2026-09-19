@@ -1,9 +1,9 @@
 package controller
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -11,6 +11,7 @@ import (
 	"github.com/gdamore/tcell/v2"
 	log "github.com/sirupsen/logrus"
 
+	"github.com/nexusriot/redis-walker/pkg/format"
 	"github.com/nexusriot/redis-walker/pkg/model"
 	"github.com/nexusriot/redis-walker/pkg/view"
 	"github.com/rivo/tview"
@@ -19,33 +20,57 @@ import (
 // upItem is the label of the "go to parent" entry that is always first.
 const upItem = ".."
 
+// valueMode selects how a value is rendered in the details pane.
+type valueMode int
+
+const (
+	valueAuto valueMode = iota
+	valueRaw
+	valueHex
+)
+
+func (m valueMode) String() string {
+	switch m {
+	case valueRaw:
+		return "raw"
+	case valueHex:
+		return "hex"
+	default:
+		return "decoded"
+	}
+}
+
+// ConnectFunc opens an additional connection, used for the second pane and for
+// switching database.
+type ConnectFunc func(ctx context.Context, db int) (*model.Model, error)
+
 // Controller wires the Redis model to the tview UI.
 type Controller struct {
 	debug bool
 	view  *view.View
-	model *model.Model
 
-	// currentPrefix is the *real* Redis key prefix of the directory being
-	// shown ("" at the root, otherwise ending in "/").
-	currentPrefix string
-	// currentNodes maps a list item's hidden key to its node.
-	currentNodes map[string]*model.Node
-	// ordered holds the display labels in list order (without "..").
-	ordered []string
-	// position remembers the cursor per directory prefix.
-	position map[string]int
+	panes  []*pane
+	active int
+
+	job        *job
+	idleStatus string
+	valueMode  valueMode
+
+	connect ConnectFunc
+	editor  string
 }
 
-// New creates a controller for the given model.
+// New creates a controller for the given model and view.
 func New(m *model.Model, v *view.View, debug bool) *Controller {
-	return &Controller{
-		debug:         debug,
-		view:          v,
-		model:         m,
-		currentPrefix: "",
-		currentNodes:  make(map[string]*model.Node),
-		position:      make(map[string]int),
+	c := &Controller{
+		debug: debug,
+		view:  v,
 	}
+	c.panes = []*pane{
+		newPane(0, m, v.Lists[0], false),
+		newPane(1, m, v.Lists[1], false),
+	}
+	return c
 }
 
 // NewController creates the view and the controller for a Redis endpoint.
@@ -55,6 +80,12 @@ func NewController(m *model.Model, host, port string, db int, debug bool) *Contr
 	return New(m, v, debug)
 }
 
+// SetConnect installs the factory used to open further connections.
+func (c *Controller) SetConnect(fn ConnectFunc) { c.connect = fn }
+
+// SetEditor overrides the external editor command; empty means $VISUAL/$EDITOR.
+func (c *Controller) SetEditor(cmd string) { c.editor = cmd }
+
 func (c *Controller) dbg(msg string, fields log.Fields) {
 	if !c.debug {
 		return
@@ -62,14 +93,11 @@ func (c *Controller) dbg(msg string, fields log.Fields) {
 	log.WithFields(fields).Debug(msg)
 }
 
-// mapKeyOf builds a list item key that is unique even when a directory and a
-// plain key share the same name ("a" and "a/b" both exist).
-func mapKeyOf(n *model.Node) string {
-	if n.IsDir {
-		return n.Key + "|dir"
-	}
-	return n.Key + "|file"
-}
+// cur is the pane the user is working in.
+func (c *Controller) cur() *pane { return c.panes[c.active] }
+
+// other is the pane that is not active.
+func (c *Controller) other() *pane { return c.panes[1-c.active] }
 
 func displayName(base string, isDir bool) string {
 	if isDir {
@@ -110,207 +138,285 @@ func editable(n *model.Node) error {
 }
 
 func humanTTL(d time.Duration) string {
-	switch {
-	case d < 0:
+	if d < 0 {
 		return "none"
-	default:
-		return d.Truncate(time.Second).String()
 	}
+	return d.Truncate(time.Second).String()
 }
 
-// makeNodeMap reloads the current directory. On error the previous listing is
-// dropped so that stale entries are never shown for the new directory.
-func (c *Controller) makeNodeMap() (truncated bool, err error) {
-	c.dbg("makeNodeMap start", log.Fields{"prefix": c.currentPrefix})
-
-	listing, err := c.model.Ls(c.currentPrefix)
-	if err != nil {
-		c.currentNodes = make(map[string]*model.Node)
-		return false, err
+// humanBytes renders a byte count in a compact form.
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
 	}
-	m := make(map[string]*model.Node, len(listing.Nodes))
-	for _, n := range listing.Nodes {
-		m[mapKeyOf(n)] = n
+	div, exp := int64(unit), 0
+	for v := n / unit; v >= unit && exp < 4; v /= unit {
+		div *= unit
+		exp++
 	}
-	c.currentNodes = m
-	c.dbg("makeNodeMap done", log.Fields{"prefix": c.currentPrefix, "count": len(m)})
-	return listing.Truncated, nil
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTP"[exp])
 }
 
-// sortedMapKeys returns directory keys first, then leaf keys, each sorted by
-// the name shown to the user. This is the single source of truth for the list
-// order; search and "jump" rely on it.
-func (c *Controller) sortedMapKeys() (dirs, files []string) {
-	for mk, n := range c.currentNodes {
-		if n.IsDir {
-			dirs = append(dirs, mk)
-		} else {
-			files = append(files, mk)
+// Run starts the UI event loop.
+func (c *Controller) Run() error {
+	for _, p := range c.panes {
+		p.list.SetChangedFunc(func(_ int, _ string, secondary string, _ rune) {
+			c.fillDetails(strings.TrimSpace(secondary))
+		})
+	}
+	c.setInput()
+	c.reload(nil)
+	return c.view.App.Run()
+}
+
+// Stop ends the application and releases the connections it opened.
+func (c *Controller) Stop() {
+	log.Debug("exit...")
+	c.Cancel()
+	for _, p := range c.panes {
+		if p.owned && p.model != nil {
+			_ = p.model.Close()
+			p.owned = false
 		}
 	}
-	less := func(keys []string) func(i, j int) bool {
-		return func(i, j int) bool {
-			a, b := c.currentNodes[keys[i]], c.currentNodes[keys[j]]
-			an, bn := model.BaseOf(a.Key), model.BaseOf(b.Key)
-			if an != bn {
-				return an < bn
+	c.view.App.Stop()
+}
+
+// CurrentPrefix exposes the directory of the active pane.
+func (c *Controller) CurrentPrefix() string { return c.cur().prefix }
+
+// reload re-reads the active pane and runs after() once the list is rebuilt.
+func (c *Controller) reload(after func()) { c.reloadPane(c.cur(), after) }
+
+func (c *Controller) reloadPane(p *pane, after func()) {
+	prefix := p.prefix
+	desc := "listing " + model.DisplayDir(prefix)
+	c.dbg("reload", log.Fields{"pane": p.idx, "prefix": prefix})
+
+	ok := runAsync(c, desc,
+		func(ctx context.Context, report func(string)) (*model.Listing, error) {
+			progress := throttled(report, func(done int) string {
+				return fmt.Sprintf("%d keys scanned", done)
+			})
+			return p.model.LsWithProgress(ctx, prefix, progress)
+		},
+		func(listing *model.Listing, err error) {
+			if err != nil {
+				p.nodes = make(map[string]*model.Node)
+				p.ordered = nil
+				c.renderPane(p, false)
+				c.error("Failed to list keys", err, false)
+				return
 			}
-			return a.Key < b.Key
-		}
+			p.setNodes(listing.Nodes)
+			c.renderPane(p, listing.Truncated)
+			if after != nil {
+				after()
+			}
+		})
+	if !ok && after != nil {
+		after()
 	}
-	sort.Slice(dirs, less(dirs))
-	sort.Slice(files, less(files))
-	return dirs, files
 }
 
-// updateList rebuilds the list from the current directory.
-func (c *Controller) updateList() {
-	c.dbg("updateList", log.Fields{"prefix": c.currentPrefix})
-	c.view.List.Clear()
+// renderPane rebuilds the list widget of a pane from its nodes.
+func (c *Controller) renderPane(p *pane, truncated bool) {
+	p.list.Clear()
 
-	truncated, err := c.makeNodeMap()
-	title := "[ [::b]" + tview.Escape(model.DisplayDir(c.currentPrefix)) + "[::-] ]"
+	title := "[ [::b]" + tview.Escape(p.dir()) + "[::-] ]"
+	if c.view.Dual() {
+		title = fmt.Sprintf("[ [::b]%s[::-] ] %s", tview.Escape(p.dir()), tview.Escape(p.model.Endpoint()))
+	}
 	if truncated {
 		title += " [red](truncated)[-]"
 	}
-	c.view.List.SetTitle(title)
-	if err != nil {
-		c.error("Failed to list keys", err, false)
-	}
+	p.list.SetTitle(title)
 
-	// "[..]" is always the first entry.
-	c.view.List.AddItem("[..]", upItem, 0, func() { c.Up() })
+	p.list.AddItem("[..]", upItem, 0, func() { c.upIn(p) })
 
-	dirKeys, fileKeys := c.sortedMapKeys()
-
+	dirKeys, fileKeys := p.sortedMapKeys()
 	for _, mk := range dirKeys {
-		n := c.currentNodes[mk]
+		n := p.nodes[mk]
 		base := model.BaseOf(n.Key)
-		label := c.colorize(base, "📁 "+tview.Escape(displayName(base, true)))
-		c.view.List.AddItem(label, mk, 0, func() {
-			cur, ok := c.selected()
-			if ok && cur.IsDir {
-				c.position[c.currentPrefix] = c.view.List.GetCurrentItem()
-				c.Down(cur)
+		p.list.AddItem(colorize(base, "📁 "+tview.Escape(displayName(base, true))), mk, 0, func() {
+			if cur, ok := p.selected(); ok && cur.IsDir {
+				c.downIn(p, cur)
 			}
 		})
 	}
 	for _, mk := range fileKeys {
-		n := c.currentNodes[mk]
+		n := p.nodes[mk]
 		base := model.BaseOf(n.Key)
-		label := c.colorize(base, "   "+tview.Escape(displayName(base, false)))
+		label := colorize(base, "   "+tview.Escape(displayName(base, false)))
 		if n.Type != "" && n.Type != model.TypeString {
 			label += " [blue](" + n.Type + ")[-]"
 		}
-		c.view.List.AddItem(label, mk, 0, func() {})
+		p.list.AddItem(label, mk, 0, func() {})
 	}
 
 	ordered := make([]string, 0, len(dirKeys)+len(fileKeys))
 	for _, mk := range dirKeys {
-		ordered = append(ordered, displayName(model.BaseOf(c.currentNodes[mk].Key), true))
+		ordered = append(ordered, displayName(model.BaseOf(p.nodes[mk].Key), true))
 	}
 	for _, mk := range fileKeys {
-		ordered = append(ordered, displayName(model.BaseOf(c.currentNodes[mk].Key), false))
+		ordered = append(ordered, displayName(model.BaseOf(p.nodes[mk].Key), false))
 	}
-	c.ordered = ordered
+	p.ordered = ordered
 
-	if pos, ok := c.position[c.currentPrefix]; ok {
-		if pos >= c.view.List.GetItemCount() {
-			pos = c.view.List.GetItemCount() - 1
+	if pos, ok := p.position[p.prefix]; ok {
+		if pos >= p.list.GetItemCount() {
+			pos = p.list.GetItemCount() - 1
 		}
-		c.view.List.SetCurrentItem(pos)
-		delete(c.position, c.currentPrefix)
+		p.list.SetCurrentItem(pos)
+		delete(p.position, p.prefix)
 	}
 }
 
-func (c *Controller) colorize(base string, label string) string {
+func colorize(base string, label string) string {
 	if strings.HasPrefix(base, "_") {
 		return "[yellow]" + label + "[-]"
 	}
 	return label
 }
 
-// selected returns the node under the cursor.
-func (c *Controller) selected() (*model.Node, bool) {
-	if c.view.List.GetItemCount() == 0 {
-		return nil, false
+// selected returns the node under the cursor of the active pane.
+func (c *Controller) selected() (*model.Node, bool) { return c.cur().selected() }
+
+// focus moves the cursor of the active pane to a display label.
+func (c *Controller) focus(label string) { c.focusIn(c.cur(), label) }
+
+func (c *Controller) focusIn(p *pane, label string) {
+	pos := p.indexOf(label)
+	if pos < 0 {
+		return
 	}
-	i := c.view.List.GetCurrentItem()
-	_, mk := c.view.List.GetItemText(i)
-	mk = strings.TrimSpace(mk)
-	if mk == upItem {
-		return nil, false
+	p.list.SetCurrentItem(pos)
+	if p == c.cur() {
+		_, mk := p.list.GetItemText(pos)
+		c.fillDetails(strings.TrimSpace(mk))
 	}
-	n, ok := c.currentNodes[mk]
-	return n, ok
 }
 
 func (c *Controller) fillDetails(mapKey string) {
 	c.view.Details.Clear()
-	n, ok := c.currentNodes[mapKey]
+	p := c.cur()
+	n, ok := p.nodes[mapKey]
 	if !ok {
 		return
 	}
-	fmt.Fprintf(c.view.Details, "[green] Path: [white] %s\n", sanitize(n.Name))
-	fmt.Fprintf(c.view.Details, "[green] Redis key: [white] %s\n", sanitize(n.Key))
-	fmt.Fprintf(c.view.Details, "[green] Is directory: [white] %t\n", n.IsDir)
+
+	out := c.view.Details
+	fmt.Fprintf(out, "[green] Path: [white] %s\n", sanitize(n.Name))
+	fmt.Fprintf(out, "[green] Redis key: [white] %s\n", sanitize(n.Key))
 	if n.Type != "" {
-		fmt.Fprintf(c.view.Details, "[green] Type: [white] %s\n", n.Type)
+		fmt.Fprintf(out, "[green] Type: [white] %s\n", n.Type)
 	}
-	if !n.IsDir && n.Type == model.TypeString {
-		fmt.Fprintf(c.view.Details, "[green] Size: [white] %d bytes\n", n.Size)
-		fmt.Fprintf(c.view.Details, "[green] TTL: [white] %s\n", humanTTL(n.TTL))
+
+	if n.IsDir {
+		c.writeDirDetails(n)
+		return
 	}
-	fmt.Fprintln(c.view.Details)
+	if n.Type != "" && n.Type != model.TypeString {
+		fmt.Fprintf(out, "\n[yellow] (%s values are not displayed)[-]\n", n.Type)
+		return
+	}
+
+	fmt.Fprintf(out, "[green] Size: [white] %s (%d bytes)\n", humanBytes(n.Size), n.Size)
+	fmt.Fprintf(out, "[green] TTL: [white] %s\n", humanTTL(n.TTL))
+
+	res := format.Detect(n.Value)
+	mode := c.valueMode
+	if mode == valueAuto && !res.Printable && !res.Changed {
+		mode = valueHex
+	}
+	if n.Truncated {
+		mode = valueRaw
+		if c.valueMode == valueHex {
+			mode = valueHex
+		}
+	}
+
 	switch {
-	case n.IsDir && n.Type == "":
-		return
-	case n.Type != "" && n.Type != model.TypeString:
-		fmt.Fprintf(c.view.Details, "[yellow] (%s values are not displayed)[-]\n", n.Type)
+	case mode == valueAuto && res.Changed:
+		fmt.Fprintf(out, "[green] Encoding: [white] %s\n", res.Describe())
+	case mode == valueHex:
+		fmt.Fprintf(out, "[green] View: [white] hex\n")
 	default:
-		fmt.Fprintf(c.view.Details, "[green] Value: [white]\n%s\n", sanitize(n.Value))
-		if n.Truncated {
-			fmt.Fprintf(c.view.Details, "\n[yellow] ... truncated, %d of %d bytes shown[-]\n",
-				len(n.Value), n.Size)
-		}
+		fmt.Fprintf(out, "[green] View: [white] raw (%s)\n", res.Kind)
+	}
+	fmt.Fprintln(out)
+
+	switch mode {
+	case valueHex:
+		fmt.Fprintf(out, "%s", tview.Escape(format.HexDump(n.Value, 16)))
+	case valueAuto:
+		fmt.Fprintf(out, "[green] Value: [white]\n%s\n", sanitize(res.Decoded))
+	default:
+		fmt.Fprintf(out, "[green] Value: [white]\n%s\n", sanitize(n.Value))
+	}
+
+	if n.Truncated {
+		fmt.Fprintf(out, "\n[yellow] ... truncated, %s of %s shown; open the key to see all of it[-]\n",
+			humanBytes(int64(len(n.Value))), humanBytes(n.Size))
 	}
 }
 
-// indexOf returns the list index of a display label, or -1.
-func (c *Controller) indexOf(label string) int {
-	for i, v := range c.ordered {
-		if v == label {
-			return i + 1 // account for "[..]"
-		}
-	}
-	return -1
-}
-
-// focus moves the cursor to a display label and refreshes the details pane.
-func (c *Controller) focus(label string) {
-	pos := c.indexOf(label)
-	if pos < 0 {
+// writeDirDetails prints what is known about a folder, including the cached
+// result of the last analysis.
+func (c *Controller) writeDirDetails(n *model.Node) {
+	out := c.view.Details
+	st := c.cur().stats[model.PrefixOf(n.Key)]
+	if st == nil {
+		fmt.Fprintf(out, "[green] Is directory: [white] true\n")
+		fmt.Fprintf(out, "\n[::d] Press Ctrl+A to analyze this folder.[::-]\n")
 		return
 	}
-	c.view.List.SetCurrentItem(pos)
-	_, mk := c.view.List.GetItemText(pos)
-	c.fillDetails(strings.TrimSpace(mk))
+	fmt.Fprintf(out, "\n%s", statsSummary(st))
+	fmt.Fprintf(out, "\n[::d] Ctrl+A re-reads these numbers.[::-]\n")
 }
 
-// showHelp opens the hotkeys modal and wires closing + focus restore.
-func (c *Controller) showHelp() *tcell.EventKey {
-	help := c.view.NewHotkeysModal()
-	modal := c.view.ModalEdit(help, 74, 22)
+// statsSummary renders the headline numbers of an analysis.
+func statsSummary(st *model.DirStats) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "[green] Keys: [white] %d\n", st.Keys)
+	fmt.Fprintf(&b, "[green] Folders: [white] %d\n", st.Folders)
+	fmt.Fprintf(&b, "[green] Memory: [white] %s", humanBytes(st.Bytes))
+	if st.Estimated {
+		b.WriteString(" [yellow](estimated)[-]")
+	}
+	b.WriteString("\n")
+	if len(st.Types) > 0 {
+		types := make([]string, 0, len(st.Types))
+		for _, t := range []string{"string", "hash", "list", "set", "zset", "stream"} {
+			if n, ok := st.Types[t]; ok {
+				types = append(types, fmt.Sprintf("%s %d", t, n))
+			}
+		}
+		for t, n := range st.Types {
+			if !knownType(t) {
+				types = append(types, fmt.Sprintf("%s %d", t, n))
+			}
+		}
+		fmt.Fprintf(&b, "[green] Types: [white] %s\n", strings.Join(types, ", "))
+	}
+	fmt.Fprintf(&b, "[green] With TTL: [white] %d", st.WithTTL)
+	if st.WithTTL > 0 {
+		fmt.Fprintf(&b, " (soonest %s)", humanTTL(st.SoonestTTL))
+	}
+	b.WriteString("\n")
+	if st.Truncated {
+		b.WriteString("[red] The subtree was too large to scan completely.[-]\n")
+	}
+	return b.String()
+}
 
-	help.SetInputCapture(func(_ *tcell.EventKey) *tcell.EventKey {
-		c.view.Pages.RemovePage("modal-help")
-		c.view.App.SetFocus(c.view.List)
-		return nil
-	})
-
-	c.view.Pages.AddPage("modal-help", modal, true, true)
-	c.view.App.SetFocus(help)
-	return nil
+func knownType(t string) bool {
+	switch t {
+	case "string", "hash", "list", "set", "zset", "stream":
+		return true
+	}
+	return false
 }
 
 func (c *Controller) setInput() {
@@ -322,14 +428,19 @@ func (c *Controller) setInput() {
 		return event
 	})
 
-	c.view.List.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+	capture := func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
+		case tcell.KeyEsc:
+			c.Cancel()
+			return nil
 		case tcell.KeyCtrlN:
 			return c.create()
 		case tcell.KeyDelete:
 			return c.delete()
 		case tcell.KeyCtrlE:
 			return c.editSelected()
+		case tcell.KeyCtrlO:
+			return c.editExternally()
 		case tcell.KeyCtrlS:
 			return c.search()
 		case tcell.KeyCtrlJ:
@@ -337,6 +448,23 @@ func (c *Controller) setInput() {
 		case tcell.KeyCtrlR:
 			c.Refresh()
 			return nil
+		case tcell.KeyCtrlA:
+			return c.analyze()
+		case tcell.KeyCtrlV:
+			c.cycleValueMode()
+			return nil
+		case tcell.KeyCtrlD:
+			return c.selectDatabase()
+		case tcell.KeyCtrlW, tcell.KeyF9:
+			c.ToggleDual()
+			return nil
+		case tcell.KeyTab, tcell.KeyBacktab:
+			c.SwitchPane()
+			return nil
+		case tcell.KeyF5:
+			return c.transfer(false)
+		case tcell.KeyF6:
+			return c.transfer(true)
 		case tcell.KeyF1:
 			return c.showHelp()
 		case tcell.KeyBackspace, tcell.KeyBackspace2:
@@ -351,338 +479,120 @@ func (c *Controller) setInput() {
 			}
 		}
 		return event
-	})
+	}
+	for _, p := range c.panes {
+		p.list.SetInputCapture(capture)
+	}
 }
 
-// Down descends into a directory node.
-func (c *Controller) Down(n *model.Node) {
+func (c *Controller) downIn(p *pane, n *model.Node) {
 	if n == nil || !n.IsDir {
 		return
 	}
-	c.dbg("navigate down", log.Fields{"from": c.currentPrefix, "to": model.PrefixOf(n.Key)})
-	c.currentPrefix = model.PrefixOf(n.Key)
-	c.updateList()
+	p.position[p.prefix] = p.list.GetCurrentItem()
+	c.dbg("navigate down", log.Fields{"from": p.prefix, "to": model.PrefixOf(n.Key)})
+	p.prefix = model.PrefixOf(n.Key)
+	c.reloadPane(p, nil)
 }
 
-// Up moves to the parent directory.
-func (c *Controller) Up() {
-	if c.currentPrefix == "" {
+// Up moves the active pane to the parent directory.
+func (c *Controller) Up() { c.upIn(c.cur()) }
+
+func (c *Controller) upIn(p *pane) {
+	if p.prefix == "" {
 		return
 	}
-	child := strings.TrimSuffix(c.currentPrefix, "/")
-	parent := model.ParentPrefix(c.currentPrefix)
-	c.dbg("navigate up", log.Fields{"from": c.currentPrefix, "to": parent})
-	c.currentPrefix = parent
-	c.updateList()
-	c.focus(displayName(model.BaseOf(child), true))
+	child := strings.TrimSuffix(p.prefix, "/")
+	p.prefix = model.ParentPrefix(p.prefix)
+	c.dbg("navigate up", log.Fields{"to": p.prefix})
+	c.reloadPane(p, func() {
+		c.focusIn(p, displayName(model.BaseOf(child), true))
+	})
 }
 
-// Refresh re-reads the current directory from Redis.
+// Refresh re-reads the current directory of the active pane.
 func (c *Controller) Refresh() {
-	c.position[c.currentPrefix] = c.view.List.GetCurrentItem()
-	c.updateList()
+	p := c.cur()
+	p.position[p.prefix] = p.list.GetCurrentItem()
+	c.reloadPane(p, nil)
 }
 
-// CurrentPrefix exposes the directory being shown (used by tests).
-func (c *Controller) CurrentPrefix() string { return c.currentPrefix }
-
-func (c *Controller) Stop() {
-	log.Debug("exit...")
-	c.view.App.Stop()
-}
-
-// Run starts the UI event loop.
-func (c *Controller) Run() error {
-	c.view.List.SetChangedFunc(func(_ int, _ string, secondary string, _ rune) {
-		c.fillDetails(strings.TrimSpace(secondary))
-	})
-	c.updateList()
-	c.setInput()
-	return c.view.App.Run()
-}
-
-func (c *Controller) search() *tcell.EventKey {
-	search := c.view.NewSearch()
-
-	search.SetDoneFunc(func(key tcell.Key) {
-		defer c.view.Pages.RemovePage("modal")
-		if key != tcell.KeyEnter {
-			return
-		}
-		if value := strings.TrimSpace(search.GetText()); value != "" {
-			c.focus(value)
-		}
-	})
-	search.SetAutocompleteFunc(c.matchOrdered)
-
-	c.view.Pages.AddPage("modal", c.view.ModalEdit(search, 60, 5), true, true)
-	return nil
-}
-
-// matchOrdered returns the entries of the current directory that start with
-// the given text, in list order.
-func (c *Controller) matchOrdered(currentText string) []string {
-	prefix := strings.TrimSpace(strings.ToLower(currentText))
-	if prefix == "" {
-		return nil
+// SwitchPane moves the focus to the other pane.
+func (c *Controller) SwitchPane() {
+	if !c.view.Dual() {
+		return
 	}
-	result := make([]string, 0, len(c.ordered))
-	for _, word := range c.ordered {
-		if strings.HasPrefix(strings.ToLower(word), prefix) {
-			result = append(result, word)
-		}
-	}
-	return result
-}
-
-func (c *Controller) delete() *tcell.EventKey {
-	n, ok := c.selected()
-	if !ok {
-		return nil
-	}
-
-	elem := displayName(model.BaseOf(n.Key), n.IsDir)
-	if n.IsDir {
-		elem += " (recursive)"
-	}
-	delQ := c.view.NewDeleteQ(elem)
-	delQ.SetDoneFunc(func(_ int, buttonLabel string) {
-		c.view.Pages.RemovePage("modal")
-		if buttonLabel != "ok" {
-			return
-		}
-		if err := c.deleteNode(n); err != nil {
-			log.WithError(err).Error("delete failed")
-			c.error("Error deleting key", err, false)
-		}
-	})
-	c.view.Pages.AddPage("modal", c.view.ModalEdit(delQ, 44, 9), true, true)
-	return nil
-}
-
-// deleteNode removes a key, or a whole subtree for a folder.
-func (c *Controller) deleteNode(n *model.Node) error {
-	var err error
-	if n.IsDir {
-		err = c.model.DelDir(n.Key)
+	c.active = 1 - c.active
+	c.view.SetActive(c.active)
+	if n, ok := c.selected(); ok {
+		c.fillDetails(mapKeyOf(n))
 	} else {
-		err = c.model.Del(n.Key)
+		c.view.Details.Clear()
 	}
-	if err != nil {
-		return err
-	}
-	c.view.Details.Clear()
-	c.updateList()
-	return nil
 }
 
-func (c *Controller) create() *tcell.EventKey {
-	createForm := c.view.NewCreateForm(fmt.Sprintf("Create key in: %s", model.DisplayDir(c.currentPrefix)))
-	createForm.AddButton("Save", func() {
-		name := createForm.GetFormItem(0).(*tview.InputField).GetText()
-		value := createForm.GetFormItem(1).(*tview.InputField).GetText()
-		isDir := createForm.GetFormItem(2).(*tview.Checkbox).IsChecked()
-		c.view.Pages.RemovePage("modal")
-		if err := c.createEntry(name, value, isDir); err != nil {
-			c.error("Error creating key", err, false)
-		}
-	})
-	createForm.AddButton("Quit", func() {
-		c.view.Pages.RemovePage("modal")
-	})
-	c.view.Pages.AddPage("modal", c.view.ModalEdit(createForm, 60, 13), true, true)
-	return nil
+// ToggleDual shows or hides the second pane.
+func (c *Controller) ToggleDual() {
+	if c.view.Dual() {
+		c.view.SetDual(false)
+		c.active = 0
+		c.view.SetActive(0)
+		c.renderPane(c.panes[0], false)
+		return
+	}
+
+	p := c.panes[1]
+	if p.model == nil {
+		p.model = c.panes[0].model
+	}
+	if p.prefix == "" {
+		p.prefix = c.panes[0].prefix
+	}
+	c.view.SetDual(true)
+	c.renderPane(c.panes[0], false)
+	c.reloadPane(p, nil)
 }
 
-// createEntry creates a key or a folder below the current directory and moves
-// the cursor onto it.
-func (c *Controller) createEntry(name, value string, isDir bool) error {
-	name = strings.Trim(strings.TrimSpace(name), "/")
-	if name == "" {
-		return errors.New("the key name must not be empty")
-	}
+// Dual reports whether the second pane is visible.
+func (c *Controller) Dual() bool { return c.view.Dual() }
 
-	full := model.ChildKey(c.currentPrefix, name)
-	var err error
-	if isDir {
-		err = c.model.MkDir(full)
-	} else {
-		err = c.model.Set(full, value)
+// cycleValueMode switches between the decoded, raw and hex value views.
+func (c *Controller) cycleValueMode() {
+	c.valueMode = (c.valueMode + 1) % 3
+	c.setIdleStatus("value view: " + c.valueMode.String())
+	if n, ok := c.selected(); ok {
+		c.fillDetails(mapKeyOf(n))
 	}
-	if err != nil {
-		return err
-	}
-	c.updateList()
-	// A nested name ("a/b") shows up as a folder in the current view.
-	first, _, nested := strings.Cut(name, "/")
-	c.focus(displayName(first, isDir || nested))
-	return nil
 }
 
-// editSelected opens the value editor for keys and the rename dialog for dirs.
-func (c *Controller) editSelected() *tcell.EventKey {
-	n, ok := c.selected()
-	if !ok {
+// showHelp opens the hotkeys modal and wires closing + focus restore.
+func (c *Controller) showHelp() *tcell.EventKey {
+	help := c.view.NewHotkeysModal()
+	modal := c.view.ModalEdit(help, 74, 34)
+
+	help.SetInputCapture(func(_ *tcell.EventKey) *tcell.EventKey {
+		c.view.Pages.RemovePage("modal-help")
+		c.view.App.SetFocus(c.view.List)
 		return nil
-	}
-	if n.IsDir {
-		return c.renameDir(n)
-	}
-	return c.editValue(n)
-}
-
-func (c *Controller) renameDir(n *model.Node) *tcell.EventKey {
-	curBase := model.BaseOf(n.Key)
-	form := c.view.NewEditValueForm(fmt.Sprintf("Rename folder: %s", n.Name), curBase)
-	form.AddButton("Save", func() {
-		newName := form.GetFormItem(0).(*tview.InputField).GetText()
-		c.view.Pages.RemovePage("modal")
-		if err := c.renameDirTo(n, newName); err != nil {
-			c.error("Failed to rename folder", err, false)
-		}
-	})
-	form.AddButton("Quit", func() {
-		c.view.Pages.RemovePage("modal")
-	})
-	c.view.Pages.AddPage("modal", c.view.ModalEdit(form, 60, 7), true, true)
-	return nil
-}
-
-// renameDirTo renames a folder inside the current directory.
-func (c *Controller) renameDirTo(n *model.Node, newName string) error {
-	newName = strings.TrimSpace(newName)
-	if newName == "" || strings.Contains(newName, "/") {
-		return errors.New("the name must be non-empty and must not contain '/'")
-	}
-	if newName == model.BaseOf(n.Key) {
-		return nil
-	}
-	if err := c.model.RenameDir(n.Key, model.ChildKey(c.currentPrefix, newName)); err != nil {
-		return err
-	}
-	c.updateList()
-	c.focus(displayName(newName, true))
-	return nil
-}
-
-func (c *Controller) editValue(n *model.Node) *tcell.EventKey {
-	full, err := c.loadForEdit(n)
-	if err != nil {
-		c.error("Cannot edit "+n.Name, err, false)
-		return nil
-	}
-
-	ta := c.view.NewMultilineEditor(fmt.Sprintf(" Edit: %s ", full.Name), full.Value)
-	ta.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
-		switch ev.Key() {
-		case tcell.KeyCtrlS:
-			value := ta.GetText()
-			c.view.CloseEditor()
-			if err := c.saveValue(full, value); err != nil {
-				c.error("Failed to save value", err, false)
-			}
-			return nil
-		case tcell.KeyEsc:
-			c.view.CloseEditor()
-			return nil
-		}
-		return ev
 	})
 
-	c.view.OpenEditor(ta)
+	c.view.Pages.AddPage("modal-help", modal, true, true)
+	c.view.App.SetFocus(help)
 	return nil
 }
 
-// loadForEdit re-reads a key in full and refuses values that the editor would
-// damage: the listing only holds a preview, so saving it back would truncate
-// large values, and a TextArea cannot round-trip binary data.
-func (c *Controller) loadForEdit(n *model.Node) (*model.Node, error) {
-	if err := editable(n); err != nil {
-		return nil, err
-	}
-	full, err := c.model.Get(n.Key)
-	if err != nil {
-		return nil, err
-	}
-	if err := editable(full); err != nil {
-		return nil, err
-	}
-	if !utf8.ValidString(full.Value) {
-		return nil, errors.New("the value is not valid UTF-8; editing it would corrupt binary data")
-	}
-	return full, nil
-}
-
-// saveValue writes an edited value back and keeps the cursor on the key.
-func (c *Controller) saveValue(n *model.Node, value string) error {
-	if err := c.model.Set(n.Key, value); err != nil {
-		return err
-	}
-	c.updateList()
-	c.focus(displayName(model.BaseOf(n.Key), false))
-	return nil
+func (c *Controller) closeModal(name string) {
+	c.view.Pages.RemovePage(name)
+	c.view.App.SetFocus(c.view.List)
 }
 
 func (c *Controller) error(header string, err error, fatal bool) {
 	errMsg := c.view.NewErrorMessageQ(header, err.Error())
 	errMsg.SetDoneFunc(func(_ int, _ string) {
-		c.view.Pages.RemovePage("modal-error")
-		c.view.App.SetFocus(c.view.List)
+		c.closeModal("modal-error")
 		if fatal {
 			c.view.App.Stop()
 		}
 	})
 	c.view.Pages.AddPage("modal-error", c.view.ModalEdit(errMsg, 70, 12), true, true)
-}
-
-func (c *Controller) jump() *tcell.EventKey {
-	inp := c.view.NewJump()
-	inp.SetDoneFunc(func(key tcell.Key) {
-		defer c.view.Pages.RemovePage("modal")
-		if key != tcell.KeyEnter {
-			return
-		}
-		raw := strings.TrimSpace(inp.GetText())
-		if raw == "" {
-			return
-		}
-		c.JumpTo(raw)
-	})
-
-	c.view.Pages.AddPage("modal", c.view.ModalEdit(inp, 60, 5), true, true)
-	return nil
-}
-
-// JumpTo navigates to an absolute or relative path. A trailing "/" requires the
-// target to be a directory.
-func (c *Controller) JumpTo(raw string) {
-	isDirHint := strings.HasSuffix(raw, "/")
-	target := strings.TrimSuffix(raw, "/")
-	if !strings.HasPrefix(raw, "/") {
-		target = c.currentPrefix + target
-	}
-
-	nd, err := c.model.Resolve(target)
-	if err != nil {
-		if errors.Is(err, model.ErrNotFound) {
-			c.error("Not found", errors.New(model.PathOf(target)), false)
-		} else {
-			c.error("Jump failed", err, false)
-		}
-		return
-	}
-	if isDirHint && !nd.IsDir {
-		c.error("Not a folder", errors.New(nd.Name), false)
-		return
-	}
-
-	if nd.IsDir {
-		c.currentPrefix = model.PrefixOf(nd.Key)
-		c.updateList()
-		return
-	}
-
-	c.currentPrefix = model.ParentPrefix(model.PrefixOf(nd.Key))
-	c.updateList()
-	c.focus(displayName(model.BaseOf(nd.Key), false))
 }

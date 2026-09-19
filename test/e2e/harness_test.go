@@ -9,7 +9,6 @@ package e2e
 import (
 	"context"
 	"os"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +16,7 @@ import (
 	"github.com/gdamore/tcell/v2"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/nexusriot/redis-walker/internal/uitest"
 	"github.com/nexusriot/redis-walker/pkg/controller"
 	"github.com/nexusriot/redis-walker/pkg/model"
 	"github.com/nexusriot/redis-walker/pkg/view"
@@ -64,12 +64,11 @@ func ctx(t *testing.T) context.Context {
 
 // app is a running redis-walker instance on a simulation screen.
 type app struct {
-	t      *testing.T
-	rdb    *redis.Client
-	view   *view.View
-	ctrl   *controller.Controller
-	screen tcell.SimulationScreen
-	done   chan error
+	*uitest.Driver
+	t    *testing.T
+	rdb  *redis.Client
+	view *view.View
+	ctrl *controller.Controller
 }
 
 // start flushes the database, seeds it and launches the application.
@@ -92,144 +91,54 @@ func start(t *testing.T, seed map[string]string) *app {
 	if err != nil {
 		t.Fatalf("model.New: %v", err)
 	}
+	t.Cleanup(func() { _ = m.Close() })
 
 	v := view.NewView()
 	v.SetHeader("redis-walker e2e")
-	screen := tcell.NewSimulationScreen("UTF-8")
-	v.App.SetScreen(screen)
-	screen.SetSize(140, 40)
 
-	a := &app{
-		t:      t,
-		rdb:    rdb,
-		view:   v,
-		ctrl:   controller.New(m, v, true),
-		screen: screen,
-		done:   make(chan error, 1),
-	}
-	go func() { a.done <- a.ctrl.Run() }()
+	a := &app{t: t, rdb: rdb, view: v, ctrl: controller.New(m, v, true)}
+	a.Driver = uitest.New(t, v.App, 140, 40)
+	a.Start(a.ctrl.Run)
 
-	t.Cleanup(func() {
-		v.App.Stop()
-		select {
-		case <-a.done:
-		case <-time.After(10 * time.Second):
-			t.Error("the application did not stop")
-		}
-		_ = m.Close()
-	})
-
-	a.sync()
+	a.Sync()
+	a.waitIdle()
 	return a
 }
 
-// onLoop runs f on the tview event loop and waits for it to finish. It must
-// only be called from the test goroutine: calling it from inside another
-// queued closure would deadlock the loop.
-func (a *app) onLoop(f func()) {
-	a.t.Helper()
-	done := make(chan struct{})
-	a.view.App.QueueUpdateDraw(func() {
-		defer close(done)
-		f()
-	})
-	select {
-	case <-done:
-	case err := <-a.done:
-		a.t.Fatalf("the application stopped early: %v", err)
-	case <-time.After(10 * time.Second):
-		a.t.Fatal("timed out waiting for the UI")
-	}
-}
+// onLoop runs f on the event loop and waits for it.
+func (a *app) onLoop(f func()) { a.OnLoop(f) }
 
 // sync waits until every queued UI update has been drawn.
-func (a *app) sync() { a.onLoop(func() {}) }
+func (a *app) sync() { a.Sync() }
 
-// press injects a key and waits for the UI to settle.
+// settle gives the event loop time to consume injected events.
+func (a *app) settle() { a.Settle() }
+
+// waitFor polls a condition against the UI.
+func (a *app) waitFor(what string, cond func() bool) { a.WaitFor(what, cond) }
+
+// waitIdle blocks until no background operation is running.
+func (a *app) waitIdle() {
+	a.t.Helper()
+	a.waitFor("the controller to become idle", func() bool { return a.ctrl.Idle() })
+}
+
+// press injects a key and waits for the UI and any work it started.
 func (a *app) press(k tcell.Key) {
-	a.screen.InjectKey(k, 0, tcell.ModNone)
+	a.Key(k, 0)
+	a.settle()
+	a.waitIdle()
 	a.settle()
 }
 
 // typeText injects a string one rune at a time.
-func (a *app) typeText(s string) {
-	for _, r := range s {
-		a.screen.InjectKey(tcell.KeyRune, r, tcell.ModNone)
-	}
-	a.settle()
-}
+func (a *app) typeText(s string) { a.Type(s) }
 
-// settle gives the event loop time to consume injected events.
-func (a *app) settle() {
-	a.sync()
-	a.sync()
-}
+// screenText renders the simulation screen as text.
+func (a *app) screenText() string { return a.ScreenText() }
 
-// waitFor polls a condition against the UI. cond runs on the event loop, so it
-// may only use the "...Now" readers below.
-func (a *app) waitFor(what string, cond func() bool) {
-	a.t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
-	for time.Now().Before(deadline) {
-		ok := false
-		a.onLoop(func() { ok = cond() })
-		if ok {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	a.t.Fatalf("timed out waiting for %s\nscreen:\n%s", what, a.screenText())
-}
-
-// screenTextNow renders the simulation screen; must run on the event loop.
-func (a *app) screenTextNow() string {
-	var sb strings.Builder
-	cells, w, h := a.screen.GetContents()
-	for y := 0; y < h; y++ {
-		for x := 0; x < w; x++ {
-			runes := cells[y*w+x].Runes
-			if len(runes) == 0 {
-				sb.WriteRune(' ')
-				continue
-			}
-			sb.WriteRune(runes[0])
-		}
-		sb.WriteRune('\n')
-	}
-	return sb.String()
-}
-
-func (a *app) screenText() string {
-	var out string
-	a.onLoop(func() { out = a.screenTextNow() })
-	return out
-}
-
-// itemsNow returns the labels of the list; must run on the event loop.
-func (a *app) itemsNow() []string {
-	out := make([]string, 0, a.view.List.GetItemCount())
-	for i := 0; i < a.view.List.GetItemCount(); i++ {
-		main, _ := a.view.List.GetItemText(i)
-		out = append(out, main)
-	}
-	return out
-}
-
-func (a *app) items() []string {
-	var out []string
-	a.onLoop(func() { out = a.itemsNow() })
-	return out
-}
-
-// hasItem reports whether the list contains a label; must run on the loop.
-func (a *app) hasItemNow(label string) bool {
-	for _, it := range a.itemsNow() {
-		if it == label {
-			return true
-		}
-	}
-	return false
-}
+// statusNow returns the bottom status line; must run on the event loop.
+func (a *app) statusNow() string { return a.view.Status.GetText(true) }
 
 // frontPageNow returns the name of the topmost page; must run on the loop.
 func (a *app) frontPageNow() string {
@@ -237,36 +146,43 @@ func (a *app) frontPageNow() string {
 	return name
 }
 
-// colourTag matches a real tview colour/style tag, as tview itself defines it.
-// An escaped tag ("cache[1[]") deliberately does not match.
-var colourTag = regexp.MustCompile(`\[(?:[a-zA-Z]+|#[0-9a-zA-Z]{6}|-)?(?::(?:[a-zA-Z]+|#[0-9a-zA-Z]{6}|-)?)?(?::(?:[lbidrus]+|-)?)?\]`)
+// itemsNow returns the labels of the active list; must run on the loop.
+func (a *app) itemsNow() []string { return uitest.ItemsNow(a.view.List) }
 
-// escapedTag matches tview's escape form "[something[]".
-var escapedTag = regexp.MustCompile(`\[([^\[\]]*)\[\]`)
-
-// entryName reduces a list label to the plain name of the entry:
-//
-//	"   ahash [blue](hash)[-]" -> "ahash"
-//	"📁 cache[1[]/"            -> "cache[1]/"
-func entryName(label string) string {
-	// Undo the escaping first: "cache[1[]" contains a "[]" that would
-	// otherwise be eaten as an empty colour tag.
-	name := escapedTag.ReplaceAllString(label, "[$1]")
-	name = colourTag.ReplaceAllString(name, "")
-	name = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(name), "📁"))
-	if base, _, ok := strings.Cut(name, " ("); ok {
-		name = strings.TrimSpace(base)
+// listNow returns the plain entry names of a specific pane; must run on the loop.
+func (a *app) listNow(i int) []string {
+	out := uitest.ItemsNow(a.view.Lists[i])
+	for j, label := range out {
+		out[j] = uitest.EntryName(label)
 	}
-	return name
+	return out
 }
 
-// selectItem moves the cursor onto the list entry with the given label.
+// items returns the labels of the active list.
+func (a *app) items() []string {
+	var out []string
+	a.onLoop(func() { out = a.itemsNow() })
+	return out
+}
+
+// hasItemNow reports whether the list contains an entry, matched either by its
+// raw label or by its plain name; must run on the event loop.
+func (a *app) hasItemNow(label string) bool {
+	for _, it := range a.itemsNow() {
+		if it == label || uitest.EntryName(it) == uitest.EntryName(label) {
+			return true
+		}
+	}
+	return false
+}
+
+// selectItem moves the cursor onto the list entry with the given name.
 func (a *app) selectItem(label string) {
 	a.t.Helper()
 	a.waitFor("list entry "+label, func() bool {
 		for i := 0; i < a.view.List.GetItemCount(); i++ {
 			main, _ := a.view.List.GetItemText(i)
-			if entryName(main) == label {
+			if uitest.EntryName(main) == label {
 				a.view.List.SetCurrentItem(i)
 				return true
 			}
@@ -276,13 +192,23 @@ func (a *app) selectItem(label string) {
 	a.settle()
 }
 
+// currentItemNow returns the entry under the cursor; must run on the loop.
+func (a *app) currentItemNow() string {
+	main, _ := a.view.List.GetItemText(a.view.List.GetCurrentItem())
+	return uitest.EntryName(main)
+}
+
 func (a *app) currentItem() string {
 	var out string
-	a.onLoop(func() {
-		main, _ := a.view.List.GetItemText(a.view.List.GetCurrentItem())
-		out = main
-	})
+	a.onLoop(func() { out = a.currentItemNow() })
 	return out
+}
+
+// waitForCursor waits until the cursor rests on the named entry. Navigation is
+// asynchronous, so the cursor moves a moment after the listing arrives.
+func (a *app) waitForCursor(name string) {
+	a.t.Helper()
+	a.waitFor("the cursor on "+name, func() bool { return a.currentItemNow() == name })
 }
 
 func (a *app) get(key string) string {

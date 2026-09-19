@@ -40,7 +40,7 @@ func names(l *Listing) []string {
 
 func mustLs(t *testing.T, m *Model, prefix string) *Listing {
 	t.Helper()
-	l, err := m.Ls(prefix)
+	l, err := m.Ls(bg, prefix)
 	if err != nil {
 		t.Fatalf("Ls(%q): %v", prefix, err)
 	}
@@ -126,7 +126,7 @@ func TestLsKeepsRealKeyForNonSlashKeys(t *testing.T) {
 	if n.Name != "/session:42" {
 		t.Fatalf("Name = %q, want %q", n.Name, "/session:42")
 	}
-	if err := m.Del(n.Key); err != nil {
+	if err := m.Del(bg, n.Key); err != nil {
 		t.Fatalf("Del: %v", err)
 	}
 	if mr.Exists("session:42") {
@@ -162,7 +162,7 @@ func TestGlobCharactersInKeyNames(t *testing.T) {
 	if got := names(l); len(got) != 2 {
 		t.Fatalf("Ls(cache[1]/) = %v, want the 2 keys of that folder", got)
 	}
-	if err := m.DelDir("cache[1]"); err != nil {
+	if err := m.DelDir(bg, "cache[1]"); err != nil {
 		t.Fatalf("DelDir: %v", err)
 	}
 	for _, k := range []string{"cache1/c", "cacheX/d"} {
@@ -260,7 +260,7 @@ func TestGetReturnsFullValue(t *testing.T) {
 	m, mr := newTestModel(t, func(o *Options) { o.PreviewBytes = 2 })
 	mr.Set("k", "0123456789")
 
-	n, err := m.Get("k")
+	n, err := m.Get(bg, "k")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,7 +273,7 @@ func TestGetDirectory(t *testing.T) {
 	m, mr := newTestModel(t)
 	mr.Set("a/b", "1")
 
-	n, err := m.Get("a")
+	n, err := m.Get(bg, "a")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -284,7 +284,7 @@ func TestGetDirectory(t *testing.T) {
 
 func TestGetNotFound(t *testing.T) {
 	m, _ := newTestModel(t)
-	if _, err := m.Get("nope"); !errors.Is(err, ErrNotFound) {
+	if _, err := m.Get(bg, "nope"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("err = %v, want ErrNotFound", err)
 	}
 }
@@ -292,7 +292,7 @@ func TestGetNotFound(t *testing.T) {
 func TestGetNonStringDoesNotFail(t *testing.T) {
 	m, mr := newTestModel(t)
 	mr.HSet("h", "f", "v")
-	n, err := m.Get("h")
+	n, err := m.Get(bg, "h")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -307,7 +307,7 @@ func TestResolveTriesBothSlashVariants(t *testing.T) {
 	mr.Set("/legacy", "v")
 
 	for _, in := range []string{"user:1", "/user:1"} {
-		n, err := m.Resolve(in)
+		n, err := m.Resolve(bg, in)
 		if err != nil {
 			t.Fatalf("Resolve(%q): %v", in, err)
 		}
@@ -315,7 +315,7 @@ func TestResolveTriesBothSlashVariants(t *testing.T) {
 			t.Fatalf("Resolve(%q).Key = %q", in, n.Key)
 		}
 	}
-	n, err := m.Resolve("/legacy")
+	n, err := m.Resolve(bg, "/legacy")
 	if err != nil || n.Key != "/legacy" {
 		t.Fatalf("Resolve(/legacy) = %+v, %v", n, err)
 	}
@@ -326,7 +326,7 @@ func TestSetKeepsTTL(t *testing.T) {
 	mr.Set("k", "old")
 	mr.SetTTL("k", time.Minute)
 
-	if err := m.Set("k", "new"); err != nil {
+	if err := m.Set(bg, "k", "new"); err != nil {
 		t.Fatal(err)
 	}
 	if got := mr.TTL("k"); got <= 0 {
@@ -340,7 +340,7 @@ func TestSetKeepsTTL(t *testing.T) {
 func TestSetRefusesNonStringKeys(t *testing.T) {
 	m, mr := newTestModel(t)
 	mr.HSet("h", "f", "v")
-	if err := m.Set("h", "oops"); !errors.Is(err, ErrWrongType) {
+	if err := m.Set(bg, "h", "oops"); !errors.Is(err, ErrWrongType) {
 		t.Fatalf("err = %v, want ErrWrongType", err)
 	}
 	if mr.Type("h") != "hash" {
@@ -350,14 +350,14 @@ func TestSetRefusesNonStringKeys(t *testing.T) {
 
 func TestSetRejectsRoot(t *testing.T) {
 	m, _ := newTestModel(t)
-	if err := m.Set("", "v"); err == nil {
+	if err := m.Set(bg, "", "v"); err == nil {
 		t.Fatal("expected an error for the root")
 	}
 }
 
 func TestMkDirCreatesMarkerOnlyWhenEmpty(t *testing.T) {
 	m, mr := newTestModel(t)
-	if err := m.MkDir("new"); err != nil {
+	if err := m.MkDir(bg, "new"); err != nil {
 		t.Fatal(err)
 	}
 	if !mr.Exists("new/" + dirMarker) {
@@ -365,7 +365,7 @@ func TestMkDirCreatesMarkerOnlyWhenEmpty(t *testing.T) {
 	}
 
 	mr.Set("used/child", "1")
-	if err := m.MkDir("used"); err != nil {
+	if err := m.MkDir(bg, "used"); err != nil {
 		t.Fatal(err)
 	}
 	if mr.Exists("used/" + dirMarker) {
@@ -380,7 +380,7 @@ func TestDelDirRemovesSubtreeAndOwnKey(t *testing.T) {
 	mr.Set("a/c/d", "2")
 	mr.Set("ab", "keep")
 
-	if err := m.DelDir("a"); err != nil {
+	if err := m.DelDir(bg, "a"); err != nil {
 		t.Fatal(err)
 	}
 	for _, k := range []string{"a", "a/b", "a/c/d"} {
@@ -396,7 +396,7 @@ func TestDelDirRemovesSubtreeAndOwnKey(t *testing.T) {
 func TestDelDirRefusesRoot(t *testing.T) {
 	m, mr := newTestModel(t)
 	mr.Set("a", "1")
-	if err := m.DelDir(""); err == nil {
+	if err := m.DelDir(bg, ""); err == nil {
 		t.Fatal("DelDir must refuse to wipe the keyspace")
 	}
 	if !mr.Exists("a") {
@@ -409,7 +409,7 @@ func TestDelDirBatchesLargeDeletes(t *testing.T) {
 	for i := 0; i < delBatchSize*2+7; i++ {
 		mr.Set("big/"+itoa(i), "v")
 	}
-	if err := m.DelDir("big"); err != nil {
+	if err := m.DelDir(bg, "big"); err != nil {
 		t.Fatal(err)
 	}
 	if keys := mr.Keys(); len(keys) != 0 {
@@ -426,7 +426,7 @@ func TestRenameDirPreservesTypesAndTTLs(t *testing.T) {
 	mr.HSet("old/h", "f", "v")
 	mr.Set("old/deep/x", "1")
 
-	if err := m.RenameDir("old", "new"); err != nil {
+	if err := m.RenameDir(bg, "old", "new"); err != nil {
 		t.Fatal(err)
 	}
 	if mr.Exists("old/s") || mr.Exists("old/h") || mr.Exists("old/deep/x") {
@@ -451,19 +451,19 @@ func TestRenameDirRejects(t *testing.T) {
 	mr.Set("a/x", "1")
 	mr.Set("b/y", "1")
 
-	if err := m.RenameDir("missing", "other"); !errors.Is(err, ErrNotFound) {
+	if err := m.RenameDir(bg, "missing", "other"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("err = %v, want ErrNotFound", err)
 	}
-	if err := m.RenameDir("a", "b"); err == nil {
+	if err := m.RenameDir(bg, "a", "b"); err == nil {
 		t.Fatal("expected an error when the target exists")
 	}
-	if err := m.RenameDir("a", "a/sub"); err == nil {
+	if err := m.RenameDir(bg, "a", "a/sub"); err == nil {
 		t.Fatal("expected an error when moving a folder into itself")
 	}
-	if err := m.RenameDir("", "x"); err == nil {
+	if err := m.RenameDir(bg, "", "x"); err == nil {
 		t.Fatal("expected an error for the root")
 	}
-	if err := m.RenameDir("a", "a"); err != nil {
+	if err := m.RenameDir(bg, "a", "a"); err != nil {
 		t.Fatalf("renaming to the same name must be a no-op, got %v", err)
 	}
 }

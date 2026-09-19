@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -31,6 +32,8 @@ func run(args []string) error {
 	var (
 		flags       config.Flags
 		showVersion bool
+		asJSON      bool
+		editor      string
 		configPath  string
 	)
 	flags.Host.Value = "127.0.0.1"
@@ -46,7 +49,13 @@ func run(args []string) error {
 	fs.Var(&flags.Exclude, "exclude-prefixes",
 		"comma-separated list of key prefixes to exclude (e.g. '/pcp:,/metrics:')")
 	fs.StringVar(&configPath, "config", config.Path(), "path to the config file (optional)")
+	fs.StringVar(&editor, "editor", "", "editor for Ctrl+O (default $VISUAL, $EDITOR, vi)")
+	fs.BoolVar(&asJSON, "json", false, "machine readable output for the commands below")
 	fs.BoolVar(&showVersion, "version", false, "print the version and exit")
+	fs.Usage = func() {
+		fmt.Fprintf(fs.Output(), "Usage: redis-walker [flags] [command [args]]\n\n%s\nFlags:\n", commandHelp)
+		fs.PrintDefaults()
+	}
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -54,6 +63,12 @@ func run(args []string) error {
 		fmt.Println("redis-walker", view.Version)
 		return nil
 	}
+
+	rest := fs.Args()
+	if len(rest) > 0 && !isCommand(rest[0]) {
+		return fmt.Errorf("unknown command %q\n\n%s", rest[0], commandHelp)
+	}
+	headless := len(rest) > 0
 
 	log.SetOutput(os.Stderr)
 	log.SetFormatter(&log.TextFormatter{
@@ -72,10 +87,34 @@ func run(args []string) error {
 		return err
 	}
 
-	if settings.Debug {
+	switch {
+	case settings.Debug:
 		log.SetLevel(log.DebugLevel)
-	} else {
+	case headless:
+		log.SetLevel(log.WarnLevel)
+	default:
 		log.SetLevel(log.InfoLevel)
+	}
+
+	connect := func(ctx context.Context, db int) (*model.Model, error) {
+		return model.New(model.Options{
+			Host:            settings.Host,
+			Port:            settings.Port,
+			DB:              db,
+			Username:        settings.Username,
+			Password:        settings.Password,
+			ExcludePrefixes: settings.ExcludePrefixes,
+		})
+	}
+
+	m, err := connect(context.Background(), settings.DB)
+	if err != nil {
+		return fmt.Errorf("failed to connect to redis: %w", err)
+	}
+	defer m.Close()
+
+	if headless {
+		return runCommand(context.Background(), m, os.Stdout, asJSON, rest)
 	}
 
 	log.WithFields(log.Fields{
@@ -90,19 +129,8 @@ func run(args []string) error {
 		"version":          view.Version,
 	}).Info("Starting redis-walker")
 
-	m, err := model.New(model.Options{
-		Host:            settings.Host,
-		Port:            settings.Port,
-		DB:              settings.DB,
-		Username:        settings.Username,
-		Password:        settings.Password,
-		ExcludePrefixes: settings.ExcludePrefixes,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to connect to redis: %w", err)
-	}
-	defer m.Close()
-
 	ctrl := controller.NewController(m, settings.Host, settings.Port, settings.DB, settings.Debug)
+	ctrl.SetConnect(connect)
+	ctrl.SetEditor(editor)
 	return ctrl.Run()
 }

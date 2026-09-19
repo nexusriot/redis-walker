@@ -3,7 +3,39 @@
 All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.2.0] - 2026-09-19
+
+### Added (features)
+
+- **Background operations.** Every Redis call now runs on a goroutine and reports
+  back through the UI queue. A large listing no longer freezes the application:
+  the status line shows what is running and how many keys were scanned, and `Esc`
+  cancels it. Only one operation runs at a time, so the connection is never used
+  concurrently.
+- **Value decoding and hex view.** The details pane pretty prints JSON and XML and
+  unwraps gzip, zlib and base64, including nested combinations
+  (`base64 -> gzip -> json`). `Ctrl+V` cycles decoded / raw / hex, and binary
+  values start in hex. Decoding never rewrites what is stored, and an edit that
+  would break a previously valid JSON document is refused. `Ctrl+F` re-indents a
+  document in the editor.
+- **Two browser panes.** `F9` shows a second pane, `Tab` switches, `F5` copies and
+  `F6` moves the selection into the other pane's folder. `Ctrl+D` connects a pane
+  to another database. Transfers preserve type and TTL by using `COPY` on the same
+  server, `DUMP`/`RESTORE` across connections and `RENAME`/`RENAMENX` for a move
+  inside one database.
+- **Folder analysis.** `Ctrl+A` walks a subtree and reports key and folder counts,
+  memory use (`MEMORY USAGE`, estimated when unsupported), the type breakdown, how
+  many keys expire, and the largest child prefixes and keys. The numbers stay in
+  the details pane of that folder, which previously showed nothing useful.
+- **Edit in `$EDITOR`.** `Ctrl+O` suspends the UI, opens the value in
+  `$VISUAL`/`$EDITOR`/`vi` (or `-editor`) and saves the result if it changed.
+- **Non-interactive commands.** `ls`, `tree`, `cat`, `set`, `rm` and `stat`, with
+  `-json` output, reusing the same model as the browser. `set` writes to an
+  existing key however the path is spelled and creates new keys without the
+  virtual leading slash.
+- `Model` gained `Stats`, `CopyKey`, `CopyDir`, `MoveKey`, `MoveDir`, `SortNodes`
+  and progress reporting; every method now takes a `context.Context`.
+- New package `pkg/format` for encoding detection, pretty printing and hex dumps.
 
 ### Fixed (data-integrity)
 
@@ -40,7 +72,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Values containing tview markup (`[red]…`) were rendered as colours; values and
   key names are escaped, and control characters are shown as `\xNN`.
 - `[Enter]`, `[Backspace]` and `[Del]` were swallowed by the tag parser and never
-  appeared in the hint line.
+  appeared in the hint line, which is now split over two rows so it fits.
 - The error dialog was 8×3 characters and unreadable; dialogs were resized and the
   error page no longer collides with other modals.
 - Recursive delete no longer sends one huge `DEL`; keys are deleted in batches.
@@ -71,3 +103,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `/db`. Existing keys that start with `/` keep working unchanged.
 - Listings load values through two pipelines instead of one round trip per key,
   and only fetch an 8 KiB preview.
+- The per-operation timeout is 60 seconds instead of 10, because a long operation
+  can now be cancelled by hand.
+- The key hints are rendered from a table through `tview.Escape` and split over
+  two rows, so no key name can be swallowed by the tag parser again.
+- `make build` only overrides the compiled-in version when a git tag exists,
+  instead of stamping a commit hash into `-version`.
+
+### Removed
+
+- Unused API: `Model.Addr`, `Model.Databases`, `Model.TTLOf`,
+  `format.CompactJSON`, `View.Header`, `View.Active`, `Controller.Busy`,
+  `Controller.Down` and `Controller.ValueMode`.
+- Duplicated logic: the listing order lives in `model.SortNodes` and is used by
+  both the browser and the command line, the "include the folder's own key" step
+  is one helper, the input dialogs share `View.NewPrompt`, the delete dialog is
+  built from `View.NewConfirm`, and both test suites drive the UI through the new
+  `internal/uitest` package.

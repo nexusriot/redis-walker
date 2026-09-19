@@ -96,7 +96,9 @@ func (o *Options) withDefaults() {
 		o.DialTimeout = 3 * time.Second
 	}
 	if o.OpTimeout <= 0 {
-		o.OpTimeout = 10 * time.Second
+		// Generous, because the user can cancel a long operation; it only has
+		// to stop something that will never finish.
+		o.OpTimeout = 60 * time.Second
 	}
 	if o.MaxKeys <= 0 {
 		o.MaxKeys = defaultMaxKeys
@@ -113,6 +115,8 @@ type Model struct {
 	opTimeout    time.Duration
 	maxKeys      int
 	previewBytes int
+	addr         string
+	db           int
 }
 
 // New connects to Redis and returns a Model. The connection is validated with
@@ -137,7 +141,10 @@ func New(opts Options) (*Model, error) {
 		return nil, fmt.Errorf("redis ping failed: %w", err)
 	}
 
-	return NewWithClient(rdb, opts), nil
+	m := NewWithClient(rdb, opts)
+	m.addr = fmt.Sprintf("%s:%s", opts.Host, opts.Port)
+	m.db = opts.DB
+	return m, nil
 }
 
 // NewWithClient wraps an already connected client. It is mainly useful for
@@ -162,14 +169,34 @@ func NewWithClient(rdb redis.UniversalClient, opts Options) *Model {
 		opTimeout:    opts.OpTimeout,
 		maxKeys:      opts.MaxKeys,
 		previewBytes: opts.PreviewBytes,
+		addr:         fmt.Sprintf("%s:%s", opts.Host, opts.Port),
+		db:           opts.DB,
 	}
+}
+
+// DB returns the database index this model is connected to.
+func (m *Model) DB() int { return m.db }
+
+// Endpoint renders the connection for display.
+func (m *Model) Endpoint() string { return fmt.Sprintf("%s/%d", m.addr, m.db) }
+
+// SameServer reports whether two models talk to the same Redis instance, which
+// allows server-side copying.
+func (m *Model) SameServer(other *Model) bool {
+	return other != nil && m.addr != "" && m.addr == other.addr
 }
 
 // Close releases the underlying connection pool.
 func (m *Model) Close() error { return m.rdb.Close() }
 
-func (m *Model) ctx() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), m.opTimeout)
+func (m *Model) ctx(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	if m.opTimeout <= 0 {
+		return context.WithCancel(parent)
+	}
+	return context.WithTimeout(parent, m.opTimeout)
 }
 
 func (m *Model) shouldExclude(key string) bool {
@@ -188,11 +215,21 @@ func (m *Model) shouldExclude(key string) bool {
 // scan returns every key under prefix. The MATCH pattern is escaped, and every
 // returned key is verified against the prefix, so glob meta characters inside a
 // key name can never widen the result set.
+// Progress is called while a long running operation makes headway.
+type Progress func(done int)
+
 func (m *Model) scan(ctx context.Context, prefix string, limit int) (keys []string, truncated bool, err error) {
+	return m.scanProgress(ctx, prefix, limit, nil)
+}
+
+func (m *Model) scanProgress(ctx context.Context, prefix string, limit int, onProgress Progress) (keys []string, truncated bool, err error) {
 	var cursor uint64
 	match := globEscape(prefix) + "*"
 	seen := make(map[string]struct{})
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, false, err
+		}
 		batch, next, err := m.rdb.Scan(ctx, cursor, match, defaultScanCount).Result()
 		if err != nil {
 			return nil, false, err
@@ -215,6 +252,9 @@ func (m *Model) scan(ctx context.Context, prefix string, limit int) (keys []stri
 				return keys, true, nil
 			}
 		}
+		if onProgress != nil {
+			onProgress(len(keys))
+		}
 		if next == 0 {
 			return keys, false, nil
 		}
@@ -223,14 +263,19 @@ func (m *Model) scan(ctx context.Context, prefix string, limit int) (keys []stri
 }
 
 // Ls lists the direct children of a directory prefix ("" is the root).
-func (m *Model) Ls(prefix string) (*Listing, error) {
-	ctx, cancel := m.ctx()
+func (m *Model) Ls(ctx context.Context, prefix string) (*Listing, error) {
+	return m.LsWithProgress(ctx, prefix, nil)
+}
+
+// LsWithProgress lists a directory and reports the number of scanned keys.
+func (m *Model) LsWithProgress(ctx context.Context, prefix string, onProgress Progress) (*Listing, error) {
+	ctx, cancel := m.ctx(ctx)
 	defer cancel()
 
 	prefix = PrefixOf(prefix)
 	start := time.Now()
 
-	keys, truncated, err := m.scan(ctx, prefix, m.maxKeys)
+	keys, truncated, err := m.scanProgress(ctx, prefix, m.maxKeys, onProgress)
 	if err != nil {
 		log.WithError(err).WithFields(log.Fields{"op": "ls", "pfx": prefix}).Error("redis ls failed")
 		return nil, err
@@ -276,15 +321,8 @@ func (m *Model) Ls(prefix string) (*Listing, error) {
 		return nil, err
 	}
 
-	ordered := make([]string, 0, len(children))
-	for k := range children {
-		ordered = append(ordered, k)
-	}
-	sort.Strings(ordered)
-
 	listing := &Listing{Truncated: truncated}
-	for _, ck := range ordered {
-		ci := children[ck]
+	for ck, ci := range children {
 		if ci.isDir {
 			listing.Nodes = append(listing.Nodes, &Node{
 				Name:  PathOf(ck),
@@ -301,6 +339,7 @@ func (m *Model) Ls(prefix string) (*Listing, error) {
 			listing.Nodes = append(listing.Nodes, n)
 		}
 	}
+	listing.Nodes = SortNodes(listing.Nodes)
 
 	log.WithFields(log.Fields{
 		"op":        "ls",
@@ -388,10 +427,42 @@ func (m *Model) loadMeta(ctx context.Context, keys []string) (map[string]keyMeta
 	return out, nil
 }
 
+// SortNodes orders a listing the way it is presented: folders first, then by
+// the name shown to the user. It is the single ordering used by the browser and
+// by the command line.
+func SortNodes(nodes []*Node) []*Node {
+	out := append([]*Node(nil), nodes...)
+	sort.SliceStable(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if a.IsDir != b.IsDir {
+			return a.IsDir
+		}
+		an, bn := BaseOf(a.Key), BaseOf(b.Key)
+		if an != bn {
+			return an < bn
+		}
+		return a.Key < b.Key
+	})
+	return out
+}
+
+// withOwnKey appends the key a directory may have of its own ("a" next to
+// "a/b"), which no prefix scan can return.
+func (m *Model) withOwnKey(ctx context.Context, prefix string, keys []string) []string {
+	own := strings.TrimSuffix(prefix, "/")
+	if own == "" {
+		return keys
+	}
+	if n, err := m.rdb.Exists(ctx, own).Result(); err == nil && n > 0 {
+		return append(keys, own)
+	}
+	return keys
+}
+
 // Get returns a single node, reading the full (untruncated) value for strings.
 // A key that does not exist but has children is reported as a directory.
-func (m *Model) Get(key string) (*Node, error) {
-	ctx, cancel := m.ctx()
+func (m *Model) Get(ctx context.Context, key string) (*Node, error) {
+	ctx, cancel := m.ctx(ctx)
 	defer cancel()
 	return m.get(ctx, key)
 }
@@ -435,8 +506,8 @@ func (m *Model) get(ctx context.Context, key string) (*Node, error) {
 
 // Resolve looks a user-typed path up in the keyspace. Because the leading "/"
 // of a path is virtual, both "a/b" and "/a/b" are tried.
-func (m *Model) Resolve(path string) (*Node, error) {
-	ctx, cancel := m.ctx()
+func (m *Model) Resolve(ctx context.Context, path string) (*Node, error) {
+	ctx, cancel := m.ctx(ctx)
 	defer cancel()
 
 	path = strings.TrimSpace(path)
@@ -468,8 +539,8 @@ func (m *Model) Resolve(path string) (*Node, error) {
 
 // Set writes a string value, keeping any TTL the key already has. It refuses to
 // overwrite a key that holds a non-string value.
-func (m *Model) Set(key, value string) error {
-	ctx, cancel := m.ctx()
+func (m *Model) Set(ctx context.Context, key, value string) error {
+	ctx, cancel := m.ctx(ctx)
 	defer cancel()
 
 	key = strings.TrimSuffix(key, "/")
@@ -497,8 +568,8 @@ func (m *Model) Set(key, value string) error {
 }
 
 // MkDir makes an empty directory visible by writing a placeholder leaf.
-func (m *Model) MkDir(dirKey string) error {
-	ctx, cancel := m.ctx()
+func (m *Model) MkDir(ctx context.Context, dirKey string) error {
+	ctx, cancel := m.ctx(ctx)
 	defer cancel()
 
 	dirKey = strings.TrimSuffix(dirKey, "/")
@@ -517,8 +588,8 @@ func (m *Model) MkDir(dirKey string) error {
 }
 
 // Del removes a single key of any type.
-func (m *Model) Del(key string) error {
-	ctx, cancel := m.ctx()
+func (m *Model) Del(ctx context.Context, key string) error {
+	ctx, cancel := m.ctx(ctx)
 	defer cancel()
 
 	key = strings.TrimSuffix(key, "/")
@@ -529,8 +600,8 @@ func (m *Model) Del(key string) error {
 }
 
 // DelDir recursively removes every key under a directory prefix.
-func (m *Model) DelDir(dirKey string) error {
-	ctx, cancel := m.ctx()
+func (m *Model) DelDir(ctx context.Context, dirKey string) error {
+	ctx, cancel := m.ctx(ctx)
 	defer cancel()
 
 	prefix := PrefixOf(dirKey)
@@ -541,11 +612,7 @@ func (m *Model) DelDir(dirKey string) error {
 	if err != nil {
 		return err
 	}
-	// A directory may also exist as a key of its own ("a" plus "a/b").
-	if n, err := m.rdb.Exists(ctx, strings.TrimSuffix(prefix, "/")).Result(); err == nil && n > 0 {
-		keys = append(keys, strings.TrimSuffix(prefix, "/"))
-	}
-	return m.delBatched(ctx, keys)
+	return m.delBatched(ctx, m.withOwnKey(ctx, prefix, keys))
 }
 
 func (m *Model) delBatched(ctx context.Context, keys []string) error {
@@ -563,8 +630,8 @@ func (m *Model) delBatched(ctx context.Context, keys []string) error {
 
 // RenameDir moves every key under oldDirKey to newDirKey. RENAME is used so
 // that the type, the TTL and the exact value of each key survive the move.
-func (m *Model) RenameDir(oldDirKey, newDirKey string) error {
-	ctx, cancel := m.ctx()
+func (m *Model) RenameDir(ctx context.Context, oldDirKey, newDirKey string) error {
+	ctx, cancel := m.ctx(ctx)
 	defer cancel()
 
 	oldPfx := PrefixOf(oldDirKey)

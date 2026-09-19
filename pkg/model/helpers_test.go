@@ -7,6 +7,8 @@ import (
 	"time"
 )
 
+var bg = context.Background()
+
 func itoa(i int) string { return strconv.Itoa(i) }
 
 func newTestCtx(t *testing.T) context.Context {

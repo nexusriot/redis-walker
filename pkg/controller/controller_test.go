@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/gdamore/tcell/v2"
-
 	"github.com/rivo/tview"
 
 	"github.com/nexusriot/redis-walker/pkg/model"
@@ -24,8 +23,6 @@ func TestSanitize(t *testing.T) {
 			t.Errorf("sanitize(%q) = %q, want %q", in, got, want)
 		}
 	}
-	// Regression: a value containing tview colour tags used to be rendered as
-	// colours instead of text.
 	if got := sanitize("[red]danger[-]"); got == "[red]danger[-]" {
 		t.Errorf("colour tags were not escaped: %q", got)
 	}
@@ -52,6 +49,46 @@ func TestHumanTTL(t *testing.T) {
 	}
 }
 
+func TestHumanBytes(t *testing.T) {
+	cases := map[int64]string{
+		0:       "0 B",
+		512:     "512 B",
+		2048:    "2.0 KiB",
+		1 << 20: "1.0 MiB",
+		1 << 30: "1.0 GiB",
+	}
+	for in, want := range cases {
+		if got := humanBytes(in); got != want {
+			t.Errorf("humanBytes(%d) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestTruncateMiddle(t *testing.T) {
+	if got := truncateMiddle("short", 10); got != "short" {
+		t.Errorf("got %q", got)
+	}
+	got := truncateMiddle("abcdefghijklmnop", 9)
+	if len([]rune(got)) != 9 || !strings.Contains(got, "…") {
+		t.Errorf("truncateMiddle = %q", got)
+	}
+}
+
+func TestCheckBeforeSave(t *testing.T) {
+	if err := checkBeforeSave(`{"a":1}`, `{"a":2}`); err != nil {
+		t.Errorf("valid JSON edit rejected: %v", err)
+	}
+	if err := checkBeforeSave(`{"a":1}`, `{"a":`); err == nil {
+		t.Error("a broken JSON edit must be refused")
+	}
+	if err := checkBeforeSave("plain text", "still {broken"); err != nil {
+		t.Errorf("a non-JSON value must not be validated: %v", err)
+	}
+	if err := checkBeforeSave(`{"a":1}`, "   "); err != nil {
+		t.Errorf("clearing a value must stay possible: %v", err)
+	}
+}
+
 func TestListShowsDirsFirstThenKeys(t *testing.T) {
 	h := newHarness(t, map[string]string{
 		"zeta":    "1",
@@ -67,9 +104,6 @@ func TestListShowsDirsFirstThenKeys(t *testing.T) {
 	}
 }
 
-// Regression: the search dialog sorted by display name while the list sorted by
-// an internal map key, so "jump to name" landed on the wrong row whenever one
-// name was a prefix of another.
 func TestSearchOrderMatchesListOrder(t *testing.T) {
 	h := newHarness(t, map[string]string{
 		"a/k":   "1",
@@ -93,7 +127,7 @@ func TestNavigationDownAndUp(t *testing.T) {
 		"other":       "3",
 	})
 
-	h.do(func() { h.c.JumpTo("app/") })
+	h.act(func() { h.c.JumpTo("app/") })
 	if got := h.c.CurrentPrefix(); got != "app/" {
 		t.Fatalf("prefix = %q", got)
 	}
@@ -101,45 +135,29 @@ func TestNavigationDownAndUp(t *testing.T) {
 		t.Fatalf("items = %v", got)
 	}
 
-	h.do(func() { h.c.Up() })
+	h.act(func() { h.c.Up() })
 	if got := h.c.CurrentPrefix(); got != "" {
 		t.Fatalf("prefix after Up = %q", got)
 	}
-	// The cursor must land back on the folder we came from.
 	if got := h.currentItem(); got != "📁 app/" {
 		t.Fatalf("cursor = %q, want the app folder", got)
 	}
 
-	// Up at the root is a no-op.
-	h.do(func() { h.c.Up() })
+	h.act(func() { h.c.Up() })
 	if got := h.c.CurrentPrefix(); got != "" {
 		t.Fatalf("prefix = %q", got)
 	}
 }
 
-// Regression: keys without a leading slash used to be shown under a fabricated
-// path, so editing them created a second key.
 func TestEditKeyWithoutLeadingSlash(t *testing.T) {
 	h := newHarness(t, map[string]string{"session:42": "old"})
 
-	var n *model.Node
-	h.do(func() {
-		h.v.List.SetCurrentItem(1)
-		var ok bool
-		n, ok = h.c.selected()
-		if !ok {
-			t.Error("nothing selected")
-		}
-	})
-	if n == nil || n.Key != "session:42" {
-		t.Fatalf("selected node = %+v", n)
+	n := h.node("session:42|file")
+	if n.Key != "session:42" {
+		t.Fatalf("node key = %q", n.Key)
 	}
+	h.act(func() { h.c.saveValue(n, "new") })
 
-	h.do(func() {
-		if err := h.c.saveValue(n, "new"); err != nil {
-			t.Errorf("saveValue: %v", err)
-		}
-	})
 	if v, _ := h.mr.Get("session:42"); v != "new" {
 		t.Fatalf("session:42 = %q, want the edited value", v)
 	}
@@ -148,55 +166,46 @@ func TestEditKeyWithoutLeadingSlash(t *testing.T) {
 	}
 }
 
-// Regression: the editor used the truncated listing preview, so saving a large
-// value silently cut it down to the preview size.
 func TestEditorLoadsFullValueNotPreview(t *testing.T) {
 	big := strings.Repeat("x", 1000)
 	h := newHarness(t, map[string]string{"big": big}, func(o *model.Options) {
 		o.PreviewBytes = 16
 	})
 
+	n := h.node("big|file")
+	if !n.Truncated {
+		t.Fatal("the listing should hold a truncated preview")
+	}
 	var full *model.Node
-	h.do(func() {
-		h.v.List.SetCurrentItem(1)
-		n, _ := h.c.selected()
-		if !n.Truncated {
-			t.Error("the listing should hold a truncated preview")
-		}
-		var err error
-		full, err = h.c.loadForEdit(n)
-		if err != nil {
-			t.Errorf("loadForEdit: %v", err)
-		}
-	})
+	h.act(func() { h.c.loadForEdit(n, func(fn *model.Node) { full = fn }) })
 	if full == nil || len(full.Value) != len(big) {
-		t.Fatalf("the editor received %d bytes, want %d", len(full.Value), len(big))
+		t.Fatalf("the editor received %v bytes, want %d", full, len(big))
 	}
 }
 
 func TestEditorRefusesNonStringAndBinary(t *testing.T) {
 	h := newHarness(t, map[string]string{"bin": "a\xffb"})
 	h.mr.HSet("h", "f", "v")
-	h.do(func() { h.c.updateList() })
+	h.press(tcell.KeyCtrlR)
 
-	h.do(func() {
-		for mk, n := range h.c.currentNodes {
-			_ = mk
-			if _, err := h.c.loadForEdit(n); err == nil {
-				t.Errorf("loadForEdit(%q) must fail", n.Key)
-			}
+	for _, mk := range []string{"bin|file", "h|file"} {
+		n := h.node(mk)
+		opened := false
+		h.act(func() { h.c.loadForEdit(n, func(*model.Node) { opened = true }) })
+		if opened {
+			t.Errorf("loadForEdit(%q) must not open the editor", n.Key)
 		}
-	})
+		if got := h.frontPage(); got != "modal-error" {
+			t.Errorf("no error was shown for %q (front page %q)", n.Key, got)
+		}
+		h.do(func() { h.v.Pages.RemovePage("modal-error") })
+	}
 }
 
 func TestCreateKeyAndFolder(t *testing.T) {
 	h := newHarness(t, nil)
 
-	h.do(func() {
-		if err := h.c.createEntry("cfg", "v", false); err != nil {
-			t.Errorf("createEntry: %v", err)
-		}
-	})
+	h.act(func() { h.c.createEntry("cfg", "v", false) })
 	if v, _ := h.mr.Get("cfg"); v != "v" {
 		t.Fatalf("cfg = %q", v)
 	}
@@ -204,11 +213,7 @@ func TestCreateKeyAndFolder(t *testing.T) {
 		t.Fatalf("cursor = %q", got)
 	}
 
-	h.do(func() {
-		if err := h.c.createEntry("dir", "", true); err != nil {
-			t.Errorf("createEntry: %v", err)
-		}
-	})
+	h.act(func() { h.c.createEntry("dir", "", true) })
 	if !h.mr.Exists("dir/.dir") {
 		t.Fatal("the folder marker was not created")
 	}
@@ -219,12 +224,8 @@ func TestCreateKeyAndFolder(t *testing.T) {
 
 func TestCreateInsideFolderUsesRealPrefix(t *testing.T) {
 	h := newHarness(t, map[string]string{"app/a": "1"})
-	h.do(func() { h.c.JumpTo("app/") })
-	h.do(func() {
-		if err := h.c.createEntry("b", "2", false); err != nil {
-			t.Errorf("createEntry: %v", err)
-		}
-	})
+	h.act(func() { h.c.JumpTo("app/") })
+	h.act(func() { h.c.createEntry("b", "2", false) })
 	if v, _ := h.mr.Get("app/b"); v != "2" {
 		t.Fatalf("app/b = %q", v)
 	}
@@ -232,13 +233,13 @@ func TestCreateInsideFolderUsesRealPrefix(t *testing.T) {
 
 func TestCreateRejectsEmptyName(t *testing.T) {
 	h := newHarness(t, nil)
-	h.do(func() {
-		for _, name := range []string{"", "   ", "///"} {
-			if err := h.c.createEntry(name, "v", false); err == nil {
-				t.Errorf("createEntry(%q) must fail", name)
-			}
+	for _, name := range []string{"", "   ", "///"} {
+		h.act(func() { h.c.createEntry(name, "v", false) })
+		if got := h.frontPage(); got != "modal-error" {
+			t.Errorf("createEntry(%q) must be refused", name)
 		}
-	})
+		h.do(func() { h.v.Pages.RemovePage("modal-error") })
+	}
 	if keys := h.mr.Keys(); len(keys) != 0 {
 		t.Fatalf("keys were created: %v", keys)
 	}
@@ -246,11 +247,7 @@ func TestCreateRejectsEmptyName(t *testing.T) {
 
 func TestCreateNestedNameShowsAsFolder(t *testing.T) {
 	h := newHarness(t, nil)
-	h.do(func() {
-		if err := h.c.createEntry("a/b", "v", false); err != nil {
-			t.Errorf("createEntry: %v", err)
-		}
-	})
+	h.act(func() { h.c.createEntry("a/b", "v", false) })
 	if v, _ := h.mr.Get("a/b"); v != "v" {
 		t.Fatalf("a/b = %q", v)
 	}
@@ -267,22 +264,12 @@ func TestDeleteKeyAndFolder(t *testing.T) {
 		"tree/b": "1",
 	})
 
-	h.do(func() {
-		n := h.c.currentNodes["gone|file"]
-		if err := h.c.deleteNode(n); err != nil {
-			t.Errorf("deleteNode: %v", err)
-		}
-	})
+	h.act(func() { h.c.deleteNode(h.c.cur().nodes["gone|file"]) })
 	if h.mr.Exists("gone") {
 		t.Fatal("the key was not deleted")
 	}
 
-	h.do(func() {
-		n := h.c.currentNodes["tree|dir"]
-		if err := h.c.deleteNode(n); err != nil {
-			t.Errorf("deleteNode: %v", err)
-		}
-	})
+	h.act(func() { h.c.deleteNode(h.c.cur().nodes["tree|dir"]) })
 	if h.mr.Exists("tree/a") || h.mr.Exists("tree/b") {
 		t.Fatal("the folder was not deleted recursively")
 	}
@@ -294,12 +281,7 @@ func TestDeleteKeyAndFolder(t *testing.T) {
 func TestRenameFolder(t *testing.T) {
 	h := newHarness(t, map[string]string{"old/a": "1", "old/b/c": "2"})
 
-	h.do(func() {
-		n := h.c.currentNodes["old|dir"]
-		if err := h.c.renameDirTo(n, "new"); err != nil {
-			t.Errorf("renameDirTo: %v", err)
-		}
-	})
+	h.act(func() { h.c.renameDirTo(h.c.cur().nodes["old|dir"], "new") })
 	if !h.mr.Exists("new/a") || !h.mr.Exists("new/b/c") || h.mr.Exists("old/a") {
 		t.Fatalf("keys after rename: %v", h.mr.Keys())
 	}
@@ -310,17 +292,14 @@ func TestRenameFolder(t *testing.T) {
 
 func TestRenameFolderRejectsBadNames(t *testing.T) {
 	h := newHarness(t, map[string]string{"old/a": "1"})
-	h.do(func() {
-		n := h.c.currentNodes["old|dir"]
-		for _, name := range []string{"", "  ", "a/b"} {
-			if err := h.c.renameDirTo(n, name); err == nil {
-				t.Errorf("renameDirTo(%q) must fail", name)
-			}
+	for _, name := range []string{"", "  ", "a/b"} {
+		h.act(func() { h.c.renameDirTo(h.c.cur().nodes["old|dir"], name) })
+		if got := h.frontPage(); got != "modal-error" {
+			t.Errorf("renameDirTo(%q) must be refused", name)
 		}
-		if err := h.c.renameDirTo(n, "old"); err != nil {
-			t.Errorf("renaming to the same name must be a no-op: %v", err)
-		}
-	})
+		h.do(func() { h.v.Pages.RemovePage("modal-error") })
+	}
+	h.act(func() { h.c.renameDirTo(h.c.cur().nodes["old|dir"], "old") })
 	if !h.mr.Exists("old/a") {
 		t.Fatal("the folder was damaged by a rejected rename")
 	}
@@ -328,7 +307,7 @@ func TestRenameFolderRejectsBadNames(t *testing.T) {
 
 func TestJumpToKeyMovesCursor(t *testing.T) {
 	h := newHarness(t, map[string]string{"a/b/c": "1", "a/b/d": "2"})
-	h.do(func() { h.c.JumpTo("/a/b/d") })
+	h.act(func() { h.c.JumpTo("/a/b/d") })
 	if got := h.c.CurrentPrefix(); got != "a/b/" {
 		t.Fatalf("prefix = %q", got)
 	}
@@ -339,7 +318,7 @@ func TestJumpToKeyMovesCursor(t *testing.T) {
 
 func TestJumpToMissingKeyShowsError(t *testing.T) {
 	h := newHarness(t, map[string]string{"a": "1"})
-	h.do(func() { h.c.JumpTo("/nope") })
+	h.act(func() { h.c.JumpTo("/nope") })
 	if got := h.frontPage(); got != "modal-error" {
 		t.Fatalf("front page = %q, want the error modal", got)
 	}
@@ -350,7 +329,7 @@ func TestJumpToMissingKeyShowsError(t *testing.T) {
 
 func TestJumpDirHintRejectsAKey(t *testing.T) {
 	h := newHarness(t, map[string]string{"a": "1"})
-	h.do(func() { h.c.JumpTo("/a/") })
+	h.act(func() { h.c.JumpTo("/a/") })
 	if got := h.frontPage(); got != "modal-error" {
 		t.Fatalf("front page = %q", got)
 	}
@@ -360,7 +339,7 @@ func TestDetailsShowTypeSizeAndTTL(t *testing.T) {
 	h := newHarness(t, map[string]string{"k": "hello"})
 	h.mr.SetTTL("k", time.Minute)
 	h.mr.HSet("h", "f", "v")
-	h.do(func() { h.c.updateList() })
+	h.press(tcell.KeyCtrlR)
 
 	h.do(func() { h.c.focus("k") })
 	d := h.details()
@@ -377,7 +356,6 @@ func TestDetailsShowTypeSizeAndTTL(t *testing.T) {
 	}
 }
 
-// Regression: a value containing tview markup must be shown literally.
 func TestDetailsDoNotInterpretColourTags(t *testing.T) {
 	h := newHarness(t, map[string]string{"k": "[red]boom[-]"})
 	h.do(func() { h.c.focus("k") })
@@ -397,14 +375,12 @@ func TestTruncatedListingIsFlaggedInTheTitle(t *testing.T) {
 	}
 }
 
-// Regression: when a listing failed, the previous directory's entries stayed on
-// screen under the new directory's title.
 func TestListingErrorClearsStaleNodes(t *testing.T) {
 	h := newHarness(t, map[string]string{"a": "1", "b": "2"})
-	h.mr.Close() // the server goes away
+	h.mr.Close()
 
-	h.do(func() { h.c.updateList() })
-	if got := len(h.c.currentNodes); got != 0 {
+	h.act(func() { h.c.Refresh() })
+	if got := len(h.c.cur().nodes); got != 0 {
 		t.Fatalf("%d stale nodes survived a failed listing", got)
 	}
 	if got := h.items(); len(got) != 1 || got[0] != "[..]" {
@@ -444,7 +420,7 @@ func TestKeyBindingOpensAndClosesHelp(t *testing.T) {
 
 func TestKeyBindingBackspaceGoesUp(t *testing.T) {
 	h := newHarness(t, map[string]string{"app/cfg": "1"})
-	h.do(func() { h.c.JumpTo("app/") })
+	h.act(func() { h.c.JumpTo("app/") })
 	h.key(tcell.KeyBackspace2, 0)
 	h.waitFor("the root listing", func() bool { return h.c.CurrentPrefix() == "" })
 }
@@ -453,20 +429,40 @@ func TestKeyBindingRefresh(t *testing.T) {
 	h := newHarness(t, map[string]string{"a": "1"})
 	h.mr.Set("b", "2")
 	h.key(tcell.KeyCtrlR, 0)
-	h.waitFor("the new key to appear", func() bool { return len(h.c.currentNodes) == 2 })
+	h.waitFor("the new key to appear", func() bool { return len(h.c.cur().nodes) == 2 })
 }
 
 func TestKeyBindingCtrlQStops(t *testing.T) {
 	h := newHarness(t, map[string]string{"a": "1"})
 	h.key(tcell.KeyCtrlQ, 0)
 	select {
-	case err := <-h.done:
+	case err := <-h.Done:
 		if err != nil {
 			t.Fatalf("Run returned %v", err)
 		}
-		h.done <- nil // let the cleanup hook find the result
+		h.Done <- nil
 	case <-time.After(5 * time.Second):
 		t.Fatal("Ctrl+Q did not stop the application")
+	}
+}
+
+func TestHintLineRendersKeyNames(t *testing.T) {
+	h := newHarness(t, map[string]string{"a": "1"})
+	screen := h.screenText()
+	for _, want := range []string{
+		"[Enter]", "[Backspace]", "[Del]", "[Tab]", "[F5]", "[F6]", "[F9]",
+		"[Ctrl+N]", "[Ctrl+Q]", "[F1,?]",
+	} {
+		if !strings.Contains(screen, want) {
+			t.Errorf("the hint line does not show %s", want)
+		}
+	}
+}
+
+func TestListLabelsEscapeMarkup(t *testing.T) {
+	h := newHarness(t, map[string]string{"[red]name": "1"})
+	if !strings.Contains(h.screenText(), "[red]name") {
+		t.Fatalf("the key name was interpreted as markup:\n%s", h.screenText())
 	}
 }
 
@@ -526,10 +522,9 @@ func TestDeleteOnTheParentEntryDoesNothing(t *testing.T) {
 
 func TestEditSelectedOpensTheEditorForStrings(t *testing.T) {
 	h := newHarness(t, map[string]string{"k": "value"})
-	h.do(func() {
-		h.v.List.SetCurrentItem(1)
-		h.c.editSelected()
-	})
+	h.do(func() { h.v.List.SetCurrentItem(1) })
+	h.act(func() { h.c.editSelected() })
+
 	var text string
 	h.do(func() {
 		ta, ok := h.v.App.GetFocus().(*tview.TextArea)
@@ -548,35 +543,14 @@ func TestEditSelectedOpensTheEditorForStrings(t *testing.T) {
 func TestEditSelectedRefusesHashes(t *testing.T) {
 	h := newHarness(t, nil)
 	h.mr.HSet("h", "f", "v")
-	h.do(func() {
-		h.c.updateList()
-		h.v.List.SetCurrentItem(1)
-		h.c.editSelected()
-	})
+	h.press(tcell.KeyCtrlR)
+	h.do(func() { h.v.List.SetCurrentItem(1) })
+	h.act(func() { h.c.editSelected() })
+
 	if got := h.frontPage(); got != "modal-error" {
 		t.Fatalf("front page = %q, want the error modal", got)
 	}
 	if !strings.Contains(h.screenText(), "hash") {
 		t.Fatal("the error does not name the offending type")
-	}
-}
-
-// Regression: bracketed key names made of letters ("[Enter]", "[Backspace]",
-// "[Del]") look like tview colour tags and disappeared from the hint line.
-func TestHintLineRendersKeyNames(t *testing.T) {
-	h := newHarness(t, map[string]string{"a": "1"})
-	screen := h.screenText()
-	for _, want := range []string{"[Enter]", "[Backspace]", "[Del]", "[Ctrl+N]", "[Ctrl+Q]"} {
-		if !strings.Contains(screen, want) {
-			t.Errorf("the hint line does not show %s", want)
-		}
-	}
-}
-
-// A key name that looks like a tview tag must be shown literally in the list.
-func TestListLabelsEscapeMarkup(t *testing.T) {
-	h := newHarness(t, map[string]string{"[red]name": "1"})
-	if !strings.Contains(h.screenText(), "[red]name") {
-		t.Fatalf("the key name was interpreted as markup:\n%s", h.screenText())
 	}
 }

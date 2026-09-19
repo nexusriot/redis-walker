@@ -21,11 +21,25 @@ func TestNewViewWiring(t *testing.T) {
 	}
 }
 
-func TestSetHeader(t *testing.T) {
+func TestSetHeaderIsDrawn(t *testing.T) {
 	v := NewView()
 	v.SetHeader("redis-walker test")
-	if v.Header() != "redis-walker test" {
-		t.Fatalf("Header() = %q", v.Header())
+	screen := tcell.NewSimulationScreen("UTF-8")
+	v.App.SetScreen(screen)
+	screen.SetSize(80, 24)
+	v.App.ForceDraw()
+
+	cells, w, h := screen.GetContents()
+	var sb strings.Builder
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			if r := cells[y*w+x].Runes; len(r) > 0 {
+				sb.WriteRune(r[0])
+			}
+		}
+	}
+	if !strings.Contains(sb.String(), "redis-walker test") {
+		t.Fatal("the header is not drawn")
 	}
 }
 
@@ -62,13 +76,32 @@ func TestMultilineEditorKeepsTheValue(t *testing.T) {
 // The hint line and the help modal must mention every binding the controller
 // installs, otherwise the documentation drifts away from the code.
 func TestHotkeyDocumentationMentionsEveryBinding(t *testing.T) {
-	help := helpText
-	for _, key := range []string{"Ctrl+N", "Ctrl+E", "Ctrl+S", "Ctrl+J", "Ctrl+R", "Ctrl+Q", "Del", "F1", "Backspace"} {
-		if !strings.Contains(help, key) {
+	for _, pairs := range [][][2]string{hintsTop, hintsBottom} {
+		for _, h := range pairs {
+			key := strings.Split(h[0], ",")[0]
+			if !strings.Contains(helpText, key) {
+				t.Errorf("the help modal does not document %s", key)
+			}
+		}
+	}
+	for _, key := range []string{"Ctrl+W", "Esc", "Ctrl+F"} {
+		if !strings.Contains(helpText, key) {
 			t.Errorf("the help modal does not document %s", key)
 		}
-		if !strings.Contains(keyHints, key) && key != "Backspace" && key != "Del" {
-			t.Errorf("the hint line does not mention %s", key)
+	}
+}
+
+// Every key name must survive tview's tag parser, which reads "[F5]" and
+// "[Enter]" as style tags unless they are escaped.
+func TestHintsAreEscaped(t *testing.T) {
+	rendered := renderHints(hintsTop) + " " + renderHints(hintsBottom)
+	for _, pairs := range [][][2]string{hintsTop, hintsBottom} {
+		for _, h := range pairs {
+			want := "[" + h[0] + "]"
+			escaped := "[" + h[0] + "[]"
+			if !strings.Contains(rendered, want) && !strings.Contains(rendered, escaped) {
+				t.Errorf("the hint for %s is neither literal nor escaped", h[0])
+			}
 		}
 	}
 }

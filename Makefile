@@ -1,7 +1,9 @@
 BINARY   := redis-walker
 PKG      := github.com/nexusriot/redis-walker
-VERSION  ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-LDFLAGS  := -s -w -X $(PKG)/pkg/view.Version=$(VERSION)
+## VERSION is taken from a git tag when there is one; without a tag the version
+## compiled into pkg/view is kept instead of a meaningless commit hash.
+VERSION  ?= $(shell git describe --tags --dirty 2>/dev/null)
+LDFLAGS  := -s -w $(if $(VERSION),-X $(PKG)/pkg/view.Version=$(VERSION))
 COMPOSE  := docker compose -f test/e2e/docker-compose.yml
 
 .PHONY: all build install test race cover lint fmt vet e2e e2e-down clean
