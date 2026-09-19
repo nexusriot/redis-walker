@@ -1,157 +1,136 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
+	"fmt"
 	"os"
-	"strconv"
 
 	log "github.com/sirupsen/logrus"
 
 	"github.com/nexusriot/redis-walker/pkg/config"
 	"github.com/nexusriot/redis-walker/pkg/controller"
 	"github.com/nexusriot/redis-walker/pkg/model"
+	"github.com/nexusriot/redis-walker/pkg/view"
 )
 
-type stringFlag struct {
-	value string
-	set   bool
+func main() {
+	err := run(os.Args[1:])
+	switch {
+	case err == nil:
+	case errors.Is(err, flag.ErrHelp):
+		// "-h" already printed the usage.
+		os.Exit(2)
+	default:
+		log.WithError(err).Error("redis-walker exited with error")
+		os.Exit(1)
+	}
 }
 
-func (f *stringFlag) String() string { return f.value }
-func (f *stringFlag) Set(s string) error {
-	f.value = s
-	f.set = true
-	return nil
-}
+func run(args []string) error {
+	var (
+		flags       config.Flags
+		showVersion bool
+		asJSON      bool
+		editor      string
+		configPath  string
+	)
+	flags.Host.Value = "127.0.0.1"
+	flags.Port.Value = "6379"
 
-type boolFlag struct {
-	value bool
-	set   bool
-}
-
-func (f *boolFlag) String() string { return strconv.FormatBool(f.value) }
-func (f *boolFlag) Set(s string) error {
-	v, err := strconv.ParseBool(s)
-	if err != nil {
+	fs := flag.NewFlagSet("redis-walker", flag.ContinueOnError)
+	fs.Var(&flags.Host, "host", "redis host")
+	fs.Var(&flags.Port, "port", "redis port")
+	fs.Var(&flags.DB, "db", "redis database index")
+	fs.Var(&flags.Debug, "debug", "enable debug logging")
+	fs.Var(&flags.Username, "username", "redis username (ACL user, optional)")
+	fs.Var(&flags.Password, "password", "redis password (optional)")
+	fs.Var(&flags.Exclude, "exclude-prefixes",
+		"comma-separated list of key prefixes to exclude (e.g. '/pcp:,/metrics:')")
+	fs.StringVar(&configPath, "config", config.Path(), "path to the config file (optional)")
+	fs.StringVar(&editor, "editor", "", "editor for Ctrl+O (default $VISUAL, $EDITOR, vi)")
+	fs.BoolVar(&asJSON, "json", false, "machine readable output for the commands below")
+	fs.BoolVar(&showVersion, "version", false, "print the version and exit")
+	fs.Usage = func() {
+		fmt.Fprintf(fs.Output(), "Usage: redis-walker [flags] [command [args]]\n\n%s\nFlags:\n", commandHelp)
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	f.value = v
-	f.set = true
-	return nil
-}
+	if showVersion {
+		fmt.Println("redis-walker", view.Version)
+		return nil
+	}
 
-func main() {
-	var (
-		hostFlag     = &stringFlag{value: "127.0.0.1"}
-		portFlag     = &stringFlag{value: "6379"}
-		dbFlag       = &stringFlag{value: "0"}
-		debugFlag    = &boolFlag{value: false}
-		usernameFlag = &stringFlag{value: ""} // Redis ACL username
-		passwordFlag = &stringFlag{value: ""} // Redis password
-		excludeFlag  = &stringFlag{value: ""} // comma-separated prefixes
-	)
+	rest := fs.Args()
+	if len(rest) > 0 && !isCommand(rest[0]) {
+		return fmt.Errorf("unknown command %q\n\n%s", rest[0], commandHelp)
+	}
+	headless := len(rest) > 0
 
-	flag.Var(hostFlag, "host", "redis host (default: 127.0.0.1)")
-	flag.Var(portFlag, "port", "redis port (default: 6379)")
-	flag.Var(dbFlag, "db", "redis database index (default: 0)")
-	flag.Var(debugFlag, "debug", "enable debug logging (true/false)")
-	flag.Var(usernameFlag, "username", "redis username (ACL user, optional)")
-	flag.Var(passwordFlag, "password", "redis password (optional)")
-	flag.Var(excludeFlag, "exclude-prefixes",
-		"comma-separated list of key prefixes to exclude (e.g. '/pcp:,/metrics:')")
-	flag.Parse()
-
-	// Logging setup
 	log.SetOutput(os.Stderr)
 	log.SetFormatter(&log.TextFormatter{
 		FullTimestamp:   true,
 		TimestampFormat: "2006-01-02 15:04:05",
 	})
 
-	// Load config (optional)
-	cfg, err := config.Load(config.DefaultConfigPath)
+	cfg, err := config.Load(configPath)
 	if err != nil {
 		log.WithError(err).Warn("failed to load config file, using flags/defaults only")
 		cfg = &config.Config{}
 	}
 
-	// Resolve host: flag wins over config, else default in flag struct.
-	host := hostFlag.value
-	if !hostFlag.set && cfg.Host != "" {
-		host = cfg.Host
+	settings, err := config.Resolve(&flags, cfg)
+	if err != nil {
+		return err
 	}
 
-	// Resolve port
-	port := portFlag.value
-	if !portFlag.set && cfg.Port != "" {
-		port = cfg.Port
-	}
-
-	// Resolve DB index
-	var dbIdx int
-	if dbFlag.set {
-		tmp, err := strconv.Atoi(dbFlag.value)
-		if err != nil || tmp < 0 {
-			dbIdx = 0
-		} else {
-			dbIdx = tmp
-		}
-	} else if cfg.DB != nil && *cfg.DB >= 0 {
-		dbIdx = *cfg.DB
-	} else {
-		dbIdx = 0
-	}
-
-	// Resolve debug
-	debug := debugFlag.value
-	if !debugFlag.set && cfg.Debug != nil {
-		debug = *cfg.Debug
-	}
-
-	// Resolve username/password
-	username := usernameFlag.value
-	if !usernameFlag.set && cfg.Username != "" {
-		username = cfg.Username
-	}
-	password := passwordFlag.value
-	if !passwordFlag.set && cfg.Password != "" {
-		password = cfg.Password
-	}
-
-	// Resolve exclude prefixes
-	var excludePrefixes []string
-	if excludeFlag.set {
-		excludePrefixes = config.ParseExcludeList(excludeFlag.value)
-	} else if len(cfg.ExcludePrefixes) > 0 {
-		excludePrefixes = cfg.ExcludePrefixes
-	}
-
-	if debug {
+	switch {
+	case settings.Debug:
 		log.SetLevel(log.DebugLevel)
-	} else {
+	case headless:
+		log.SetLevel(log.WarnLevel)
+	default:
 		log.SetLevel(log.InfoLevel)
 	}
 
+	connect := func(ctx context.Context, db int) (*model.Model, error) {
+		return model.New(model.Options{
+			Host:            settings.Host,
+			Port:            settings.Port,
+			DB:              db,
+			Username:        settings.Username,
+			Password:        settings.Password,
+			ExcludePrefixes: settings.ExcludePrefixes,
+		})
+	}
+
+	m, err := connect(context.Background(), settings.DB)
+	if err != nil {
+		return fmt.Errorf("failed to connect to redis: %w", err)
+	}
+	defer m.Close()
+
+	if headless {
+		return runCommand(context.Background(), m, os.Stdout, asJSON, rest)
+	}
+
 	log.WithFields(log.Fields{
-		"host":             host,
-		"port":             port,
-		"db":               dbIdx,
-		"debug":            debug,
-		"username":         username,
-		"auth_enabled":     password != "",
-		"exclude_prefixes": excludePrefixes,
-		"config_path":      config.DefaultConfigPath,
+		"host":             settings.Host,
+		"port":             settings.Port,
+		"db":               settings.DB,
+		"debug":            settings.Debug,
+		"username":         settings.Username,
+		"auth_enabled":     settings.Password != "",
+		"exclude_prefixes": settings.ExcludePrefixes,
+		"config_path":      configPath,
+		"version":          view.Version,
 	}).Info("Starting redis-walker")
 
-	m, err := model.NewModel(host, port, dbIdx, username, password, excludePrefixes)
-	if err != nil {
-		log.WithError(err).Error("failed to create Redis model")
-		os.Exit(1)
-	}
-
-	ctrl := controller.NewController(m, host, port, dbIdx, debug)
-	if err := ctrl.Run(); err != nil {
-		log.WithError(err).Error("redis-walker exited with error")
-		os.Exit(1)
-	}
+	ctrl := controller.NewController(m, settings.Host, settings.Port, settings.DB, settings.Debug)
+	ctrl.SetConnect(connect)
+	ctrl.SetEditor(editor)
+	return ctrl.Run()
 }

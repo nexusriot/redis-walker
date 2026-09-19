@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -11,469 +12,664 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-type Model struct {
-	rdb     *redis.Client
-	exclude []string
-}
+const (
+	// defaultScanCount is the COUNT hint passed to SCAN.
+	defaultScanCount = 1000
+	// defaultMaxKeys caps a single listing so that a huge keyspace cannot
+	// exhaust memory; the listing is reported as truncated instead.
+	defaultMaxKeys = 100000
+	// defaultPreviewBytes is how much of a string value is loaded for the
+	// list view. The full value is only read when a key is opened.
+	defaultPreviewBytes = 8192
+	// delBatchSize bounds the number of keys sent to a single DEL so that a
+	// recursive delete cannot block the server for seconds.
+	delBatchSize = 500
+)
 
+// TypeString is the Redis type name of plain string values, the only type
+// redis-walker can display and edit.
+const TypeString = "string"
+
+// ErrNotFound is returned when a key (or directory prefix) does not exist.
+var ErrNotFound = errors.New("not found")
+
+// ErrWrongType is returned when an operation would replace a non-string value.
+var ErrWrongType = errors.New("key holds a non-string value")
+
+// Node is a single entry of a directory listing.
 type Node struct {
-	Name  string
+	// Name is the virtual path shown in the UI.
+	Name string
+	// Key is the real Redis key (for a directory: the key prefix without the
+	// trailing slash). All mutations must use this, never Name.
+	Key string
+	// IsDir reports whether this entry has children.
 	IsDir bool
+	// Type is the Redis type of a leaf ("string", "hash", ...); empty for
+	// directories that have no key of their own.
+	Type string
+	// Value holds the string value, possibly truncated to the preview size.
 	Value string
+	// Size is the full length of the value in bytes.
+	Size int64
+	// Truncated reports whether Value is shorter than Size.
+	Truncated bool
+	// TTL is the remaining time to live, or -1 when the key never expires.
+	TTL time.Duration
 }
 
-// NewModel creates a new Redis-backed model.
-func NewModel(host, port string, db int, username, password string, excludePrefixes []string) (*Model, error) {
-	addr := fmt.Sprintf("%s:%s", host, port)
+// Listing is the result of Ls.
+type Listing struct {
+	Nodes []*Node
+	// Truncated is set when the scan hit the key limit and the listing is
+	// therefore incomplete.
+	Truncated bool
+}
 
-	opts := &redis.Options{
-		Addr:     addr,
-		DB:       db,
-		Username: username, // optional ACL user
-		Password: password, // optional password
+// Options configures a Model.
+type Options struct {
+	Host            string
+	Port            string
+	DB              int
+	Username        string
+	Password        string
+	ExcludePrefixes []string
+
+	// DialTimeout bounds the initial connection check.
+	DialTimeout time.Duration
+	// OpTimeout bounds a single user-visible operation.
+	OpTimeout time.Duration
+	// MaxKeys caps the number of keys returned by one scan.
+	MaxKeys int
+	// PreviewBytes caps how much of a value is loaded for a listing.
+	PreviewBytes int
+}
+
+func (o *Options) withDefaults() {
+	if o.Host == "" {
+		o.Host = "127.0.0.1"
 	}
+	if o.Port == "" {
+		o.Port = "6379"
+	}
+	if o.DialTimeout <= 0 {
+		o.DialTimeout = 3 * time.Second
+	}
+	if o.OpTimeout <= 0 {
+		// Generous, because the user can cancel a long operation; it only has
+		// to stop something that will never finish.
+		o.OpTimeout = 60 * time.Second
+	}
+	if o.MaxKeys <= 0 {
+		o.MaxKeys = defaultMaxKeys
+	}
+	if o.PreviewBytes <= 0 {
+		o.PreviewBytes = defaultPreviewBytes
+	}
+}
 
-	rdb := redis.NewClient(opts)
+// Model is the Redis-backed data source of the browser.
+type Model struct {
+	rdb          redis.UniversalClient
+	exclude      []string
+	opTimeout    time.Duration
+	maxKeys      int
+	previewBytes int
+	addr         string
+	db           int
+}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+// New connects to Redis and returns a Model. The connection is validated with
+// a PING so that authentication problems surface immediately.
+func New(opts Options) (*Model, error) {
+	opts.withDefaults()
+
+	rdb := redis.NewClient(&redis.Options{
+		Addr:         fmt.Sprintf("%s:%s", opts.Host, opts.Port),
+		DB:           opts.DB,
+		Username:     opts.Username, // optional ACL user
+		Password:     opts.Password, // optional password
+		DialTimeout:  opts.DialTimeout,
+		ReadTimeout:  opts.OpTimeout,
+		WriteTimeout: opts.OpTimeout,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), opts.DialTimeout)
 	defer cancel()
-
-	// Ping to validate connection
 	if err := rdb.Ping(ctx).Err(); err != nil {
+		_ = rdb.Close()
 		return nil, fmt.Errorf("redis ping failed: %w", err)
 	}
 
-	// Normalize exclude prefixes
-	normEx := make([]string, 0, len(excludePrefixes))
-	for _, p := range excludePrefixes {
+	m := NewWithClient(rdb, opts)
+	m.addr = fmt.Sprintf("%s:%s", opts.Host, opts.Port)
+	m.db = opts.DB
+	return m, nil
+}
+
+// NewWithClient wraps an already connected client. It is mainly useful for
+// tests and for embedding redis-walker in another program.
+func NewWithClient(rdb redis.UniversalClient, opts Options) *Model {
+	opts.withDefaults()
+
+	normEx := make([]string, 0, len(opts.ExcludePrefixes))
+	for _, p := range opts.ExcludePrefixes {
 		p = strings.TrimSpace(p)
 		if p == "" {
 			continue
 		}
-		normEx = append(normEx, normPath(p))
+		// Exclude rules are written as display paths ("/pcp:") but must also
+		// match keys stored without a leading slash.
+		normEx = append(normEx, PathOf(p))
 	}
 
 	return &Model{
-		rdb:     rdb,
-		exclude: normEx,
-	}, nil
+		rdb:          rdb,
+		exclude:      normEx,
+		opTimeout:    opts.OpTimeout,
+		maxKeys:      opts.MaxKeys,
+		previewBytes: opts.PreviewBytes,
+		addr:         fmt.Sprintf("%s:%s", opts.Host, opts.Port),
+		db:           opts.DB,
+	}
 }
 
-// Public API (same as etcd model, minus protocols)
+// DB returns the database index this model is connected to.
+func (m *Model) DB() int { return m.db }
 
-func (m *Model) Ls(directory string) ([]*Node, error)  { return m.ls(directory) }
-func (m *Model) Get(key string) (*Node, error)         { return m.get(key) }
-func (m *Model) Set(key, value string) error           { return m.set(key, value) }
-func (m *Model) MkDir(directory string) error          { return m.mkdir(directory) }
-func (m *Model) Del(key string) error                  { return m.del(key) }
-func (m *Model) DelDir(key string) error               { return m.deldir(key) }
-func (m *Model) RenameDir(oldDir, newDir string) error { return m.renameDir(oldDir, newDir) }
+// Endpoint renders the connection for display.
+func (m *Model) Endpoint() string { return fmt.Sprintf("%s/%d", m.addr, m.db) }
 
-const dirMarker = ".dir"
-
-func normPath(p string) string {
-	p = strings.TrimSpace(p)
-	if p == "" || p == "/" {
-		return "/"
-	}
-	if !strings.HasPrefix(p, "/") {
-		p = "/" + p
-	}
-	for strings.Contains(p, "//") {
-		p = strings.ReplaceAll(p, "//", "/")
-	}
-	if p != "/" {
-		p = strings.TrimRight(p, "/")
-	}
-	return p
+// SameServer reports whether two models talk to the same Redis instance, which
+// allows server-side copying.
+func (m *Model) SameServer(other *Model) bool {
+	return other != nil && m.addr != "" && m.addr == other.addr
 }
 
-// withTrail returns prefix for listing. Root "/" => empty prefix (all keys).
-func withTrail(p string) string {
-	p = normPath(p)
-	if p == "/" {
-		return ""
-	}
-	return strings.TrimSuffix(p, "/") + "/"
-}
+// Close releases the underlying connection pool.
+func (m *Model) Close() error { return m.rdb.Close() }
 
-func parentOf(p string) string {
-	p = normPath(p)
-	if p == "/" {
-		return "/"
+func (m *Model) ctx(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
 	}
-	i := strings.LastIndex(p, "/")
-	if i <= 0 {
-		return "/"
+	if m.opTimeout <= 0 {
+		return context.WithCancel(parent)
 	}
-	return p[:i]
-}
-
-func baseOf(p string) string {
-	p = normPath(p)
-	if p == "/" {
-		return "/"
-	}
-	i := strings.LastIndex(p, "/")
-	if i < 0 || i == len(p)-1 {
-		return p
-	}
-	return p[i+1:]
+	return context.WithTimeout(parent, m.opTimeout)
 }
 
 func (m *Model) shouldExclude(key string) bool {
 	if len(m.exclude) == 0 {
 		return false
 	}
-	k := normPath(key)
-	for _, p := range m.exclude {
-		if strings.HasPrefix(k, p) {
+	p := PathOf(key)
+	for _, ex := range m.exclude {
+		if strings.HasPrefix(p, ex) {
 			return true
 		}
 	}
 	return false
 }
 
-func (m *Model) scanKeysWithPrefix(ctx context.Context, prefix string) ([]string, error) {
-	var (
-		cursor uint64
-		all    []string
-		match  = prefix + "*"
-	)
+// scan returns every key under prefix. The MATCH pattern is escaped, and every
+// returned key is verified against the prefix, so glob meta characters inside a
+// key name can never widen the result set.
+// Progress is called while a long running operation makes headway.
+type Progress func(done int)
+
+func (m *Model) scan(ctx context.Context, prefix string, limit int) (keys []string, truncated bool, err error) {
+	return m.scanProgress(ctx, prefix, limit, nil)
+}
+
+func (m *Model) scanProgress(ctx context.Context, prefix string, limit int, onProgress Progress) (keys []string, truncated bool, err error) {
+	var cursor uint64
+	match := globEscape(prefix) + "*"
+	seen := make(map[string]struct{})
 	for {
-		keys, next, err := m.rdb.Scan(ctx, cursor, match, 1000).Result()
-		if err != nil {
-			return nil, err
+		if err := ctx.Err(); err != nil {
+			return nil, false, err
 		}
-		for _, k := range keys {
-			if m.shouldExclude(k) {
-				log.WithFields(log.Fields{
-					"op":   "scan",
-					"key":  k,
-					"pfx":  prefix,
-					"info": "excluded by prefix",
-				}).Debug("redis scan skipped key")
+		batch, next, err := m.rdb.Scan(ctx, cursor, match, defaultScanCount).Result()
+		if err != nil {
+			return nil, false, err
+		}
+		for _, k := range batch {
+			if !strings.HasPrefix(k, prefix) {
+				// Defence in depth: a server-side glob can never be trusted.
 				continue
 			}
-			all = append(all, k)
+			if m.shouldExclude(k) {
+				continue
+			}
+			if _, dup := seen[k]; dup {
+				// SCAN may return a key more than once.
+				continue
+			}
+			seen[k] = struct{}{}
+			keys = append(keys, k)
+			if limit > 0 && len(keys) >= limit {
+				return keys, true, nil
+			}
+		}
+		if onProgress != nil {
+			onProgress(len(keys))
 		}
 		if next == 0 {
-			break
+			return keys, false, nil
 		}
 		cursor = next
 	}
-	return all, nil
 }
 
-func (m *Model) ls(directory string) ([]*Node, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+// Ls lists the direct children of a directory prefix ("" is the root).
+func (m *Model) Ls(ctx context.Context, prefix string) (*Listing, error) {
+	return m.LsWithProgress(ctx, prefix, nil)
+}
+
+// LsWithProgress lists a directory and reports the number of scanned keys.
+func (m *Model) LsWithProgress(ctx context.Context, prefix string, onProgress Progress) (*Listing, error) {
+	ctx, cancel := m.ctx(ctx)
 	defer cancel()
 
-	prefix := withTrail(directory)
+	prefix = PrefixOf(prefix)
 	start := time.Now()
-	var keys []string
-	var err error
 
-	if prefix == "" {
-		// root listing: match everything
-		keys, err = m.scanKeysWithPrefix(ctx, "")
-	} else {
-		keys, err = m.scanKeysWithPrefix(ctx, prefix)
-	}
+	keys, truncated, err := m.scanProgress(ctx, prefix, m.maxKeys, onProgress)
 	if err != nil {
-		log.WithError(err).WithFields(log.Fields{
-			"op":   "ls",
-			"dir":  directory,
-			"pfx":  prefix,
-			"kind": "redis",
-		}).Error("redis ls failed")
+		log.WithError(err).WithFields(log.Fields{"op": "ls", "pfx": prefix}).Error("redis ls failed")
 		return nil, err
 	}
 
 	type childInfo struct {
-		isDir     bool
-		hasFile   bool
-		fileKey   string
-		fileValue string
+		key     string
+		segment string
+		isDir   bool
+		isLeaf  bool
 	}
 	children := map[string]*childInfo{}
-
 	for _, key := range keys {
-		if key == "" {
+		childKey, segment, isDir, ok := splitChild(prefix, key)
+		if !ok {
 			continue
 		}
-		rest := key
-		if prefix != "" {
-			rest = strings.TrimPrefix(key, prefix)
-		}
-		rest = strings.TrimLeft(rest, "/")
-		if rest == "" {
+		if segment == dirMarker && !isDir {
+			// The placeholder written by MkDir is an implementation detail.
 			continue
 		}
-		parts := strings.SplitN(rest, "/", 2)
-		child := parts[0]
-		if child == "" || child == dirMarker {
-			continue
-		}
-		ci := children[child]
+		ci := children[childKey]
 		if ci == nil {
-			ci = &childInfo{}
-			children[child] = ci
+			ci = &childInfo{key: childKey, segment: segment}
+			children[childKey] = ci
 		}
-		if len(parts) == 2 {
+		if isDir {
 			ci.isDir = true
 		} else {
-			ci.hasFile = true
-			ci.fileKey = key
+			ci.isLeaf = true
 		}
 	}
 
-	// Fetch file values (only for string keys).
-	for name, ci := range children {
-		if !ci.hasFile || ci.fileKey == "" {
-			continue
+	leaves := make([]string, 0, len(children))
+	for _, ci := range children {
+		if ci.isLeaf {
+			leaves = append(leaves, ci.key)
 		}
-
-		val, err := m.rdb.Get(ctx, ci.fileKey).Result()
-		if err != nil && err != redis.Nil {
-			// If this is a WRONGTYPE error, it means the key is not a string
-			// (hash/list/set/zset/stream). We don't want to fail the whole
-			// listing; just skip loading the value.
-			if strings.Contains(err.Error(), "WRONGTYPE") {
-				log.WithError(err).WithFields(log.Fields{
-					"op":  "ls-file",
-					"key": ci.fileKey,
-				}).Debug("non-string Redis value; skipping value load")
-				continue
-			}
-			// real error -> bubble up
-			return nil, fmt.Errorf("get %s: %w", ci.fileKey, err)
-		}
-
-		ci.fileValue = val
-		log.WithFields(log.Fields{
-			"op":   "ls-file",
-			"key":  ci.fileKey,
-			"name": name,
-		}).Debug("redis ls loaded value")
+	}
+	sort.Strings(leaves)
+	meta, err := m.loadMeta(ctx, leaves)
+	if err != nil {
+		return nil, err
 	}
 
-	names := make([]string, 0, len(children))
-	for k := range children {
-		names = append(names, k)
-	}
-	sort.Strings(names)
-
-	root := normPath(directory)
-	if root == "/" {
-		root = ""
-	}
-	var nodes []*Node
-	for _, name := range names {
-		ci := children[name]
-		full := root + "/" + name
+	listing := &Listing{Truncated: truncated}
+	for ck, ci := range children {
 		if ci.isDir {
-			nodes = append(nodes, &Node{
-				Name:  normPath(full),
+			listing.Nodes = append(listing.Nodes, &Node{
+				Name:  PathOf(ck),
+				Key:   ck,
 				IsDir: true,
+				TTL:   -1,
 			})
 		}
-		if ci.hasFile {
-			nodes = append(nodes, &Node{
-				Name:  normPath(full),
-				IsDir: false,
-				Value: ci.fileValue,
-			})
+		if ci.isLeaf {
+			n := &Node{Name: PathOf(ck), Key: ck, TTL: -1}
+			if md, ok := meta[ck]; ok {
+				n.Type, n.Value, n.Size, n.Truncated, n.TTL = md.typ, md.value, md.size, md.truncated, md.ttl
+			}
+			listing.Nodes = append(listing.Nodes, n)
 		}
 	}
+	listing.Nodes = SortNodes(listing.Nodes)
 
 	log.WithFields(log.Fields{
-		"op":       "ls",
-		"dir":      directory,
-		"pfx":      prefix,
-		"count":    len(nodes),
-		"duration": time.Since(start),
+		"op":        "ls",
+		"pfx":       prefix,
+		"keys":      len(keys),
+		"count":     len(listing.Nodes),
+		"truncated": truncated,
+		"duration":  time.Since(start),
 	}).Debug("redis ls done")
 
-	return nodes, nil
+	return listing, nil
 }
 
-func (m *Model) set(key, value string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	k := normPath(key)
-	if k == "/" {
-		return fmt.Errorf("cannot set value on root")
+type keyMeta struct {
+	typ       string
+	value     string
+	size      int64
+	truncated bool
+	ttl       time.Duration
+}
+
+// loadMeta reads type, size, preview and TTL of the given keys using two
+// pipelines instead of one round trip per key.
+func (m *Model) loadMeta(ctx context.Context, keys []string) (map[string]keyMeta, error) {
+	out := make(map[string]keyMeta, len(keys))
+	if len(keys) == 0 {
+		return out, nil
 	}
+
+	pipe := m.rdb.Pipeline()
+	typeCmds := make([]*redis.StatusCmd, len(keys))
+	ttlCmds := make([]*redis.DurationCmd, len(keys))
+	for i, k := range keys {
+		typeCmds[i] = pipe.Type(ctx, k)
+		ttlCmds[i] = pipe.TTL(ctx, k)
+	}
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return nil, fmt.Errorf("read key metadata: %w", err)
+	}
+
+	strKeys := make([]string, 0, len(keys))
+	for i, k := range keys {
+		typ, err := typeCmds[i].Result()
+		if err != nil {
+			continue
+		}
+		if typ == "none" {
+			// Deleted between SCAN and TYPE.
+			continue
+		}
+		ttl, err := ttlCmds[i].Result()
+		if err != nil {
+			ttl = -1
+		}
+		out[k] = keyMeta{typ: typ, ttl: ttl}
+		if typ == TypeString {
+			strKeys = append(strKeys, k)
+		}
+	}
+	if len(strKeys) == 0 {
+		return out, nil
+	}
+
+	pipe = m.rdb.Pipeline()
+	lenCmds := make([]*redis.IntCmd, len(strKeys))
+	valCmds := make([]*redis.StringCmd, len(strKeys))
+	for i, k := range strKeys {
+		lenCmds[i] = pipe.StrLen(ctx, k)
+		valCmds[i] = pipe.GetRange(ctx, k, 0, int64(m.previewBytes-1))
+	}
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return nil, fmt.Errorf("read key values: %w", err)
+	}
+	for i, k := range strKeys {
+		md := out[k]
+		if size, err := lenCmds[i].Result(); err == nil {
+			md.size = size
+		}
+		if val, err := valCmds[i].Result(); err == nil {
+			md.value = val
+		}
+		md.truncated = md.size > int64(len(md.value))
+		out[k] = md
+	}
+	return out, nil
+}
+
+// SortNodes orders a listing the way it is presented: folders first, then by
+// the name shown to the user. It is the single ordering used by the browser and
+// by the command line.
+func SortNodes(nodes []*Node) []*Node {
+	out := append([]*Node(nil), nodes...)
+	sort.SliceStable(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if a.IsDir != b.IsDir {
+			return a.IsDir
+		}
+		an, bn := BaseOf(a.Key), BaseOf(b.Key)
+		if an != bn {
+			return an < bn
+		}
+		return a.Key < b.Key
+	})
+	return out
+}
+
+// withOwnKey appends the key a directory may have of its own ("a" next to
+// "a/b"), which no prefix scan can return.
+func (m *Model) withOwnKey(ctx context.Context, prefix string, keys []string) []string {
+	own := strings.TrimSuffix(prefix, "/")
+	if own == "" {
+		return keys
+	}
+	if n, err := m.rdb.Exists(ctx, own).Result(); err == nil && n > 0 {
+		return append(keys, own)
+	}
+	return keys
+}
+
+// Get returns a single node, reading the full (untruncated) value for strings.
+// A key that does not exist but has children is reported as a directory.
+func (m *Model) Get(ctx context.Context, key string) (*Node, error) {
+	ctx, cancel := m.ctx(ctx)
+	defer cancel()
+	return m.get(ctx, key)
+}
+
+func (m *Model) get(ctx context.Context, key string) (*Node, error) {
+	if key == "" || key == "/" {
+		return &Node{Name: "/", Key: "", IsDir: true, TTL: -1}, nil
+	}
+	key = strings.TrimSuffix(key, "/")
+
+	typ, err := m.rdb.Type(ctx, key).Result()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return nil, err
+	}
+	if err == nil && typ != "none" {
+		n := &Node{Name: PathOf(key), Key: key, Type: typ, TTL: -1}
+		if ttl, err := m.rdb.TTL(ctx, key).Result(); err == nil {
+			n.TTL = ttl
+		}
+		if typ == TypeString {
+			val, err := m.rdb.Get(ctx, key).Result()
+			if err != nil && !errors.Is(err, redis.Nil) {
+				return nil, err
+			}
+			n.Value = val
+			n.Size = int64(len(val))
+		}
+		return n, nil
+	}
+
+	// No value of its own: it may still be a directory.
+	kids, _, err := m.scan(ctx, PrefixOf(key), 1)
+	if err != nil {
+		return nil, err
+	}
+	if len(kids) > 0 {
+		return &Node{Name: PathOf(key), Key: key, IsDir: true, TTL: -1}, nil
+	}
+	return nil, fmt.Errorf("%w: %s", ErrNotFound, PathOf(key))
+}
+
+// Resolve looks a user-typed path up in the keyspace. Because the leading "/"
+// of a path is virtual, both "a/b" and "/a/b" are tried.
+func (m *Model) Resolve(ctx context.Context, path string) (*Node, error) {
+	ctx, cancel := m.ctx(ctx)
+	defer cancel()
+
+	path = strings.TrimSpace(path)
+	if path == "" || path == "/" {
+		return &Node{Name: "/", Key: "", IsDir: true, TTL: -1}, nil
+	}
+	candidates := []string{path}
+	if trimmed := strings.TrimPrefix(path, "/"); trimmed != path && trimmed != "" {
+		candidates = append(candidates, trimmed)
+	} else if !strings.HasPrefix(path, "/") {
+		candidates = append(candidates, "/"+path)
+	}
+
+	var firstErr error
+	for _, c := range candidates {
+		n, err := m.get(ctx, c)
+		if err == nil {
+			return n, nil
+		}
+		if !errors.Is(err, ErrNotFound) {
+			return nil, err
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	return nil, firstErr
+}
+
+// Set writes a string value, keeping any TTL the key already has. It refuses to
+// overwrite a key that holds a non-string value.
+func (m *Model) Set(ctx context.Context, key, value string) error {
+	ctx, cancel := m.ctx(ctx)
+	defer cancel()
+
+	key = strings.TrimSuffix(key, "/")
+	if key == "" {
+		return errors.New("cannot set a value on the root")
+	}
+	typ, err := m.rdb.Type(ctx, key).Result()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return err
+	}
+	if err == nil && typ != "none" && typ != TypeString {
+		return fmt.Errorf("%w: %s is a %s", ErrWrongType, PathOf(key), typ)
+	}
+
 	start := time.Now()
-	if err := m.rdb.Set(ctx, k, value, 0).Err(); err != nil {
-		log.WithError(err).WithFields(log.Fields{
-			"op":  "set",
-			"key": k,
-		}).Error("redis set failed")
+	// KeepTTL: editing a value must not silently make a volatile key permanent.
+	if err := m.rdb.Set(ctx, key, value, redis.KeepTTL).Err(); err != nil {
+		log.WithError(err).WithFields(log.Fields{"op": "set", "key": key}).Error("redis set failed")
 		return err
 	}
 	log.WithFields(log.Fields{
-		"op":       "set",
-		"key":      k,
-		"size":     len(value),
-		"duration": time.Since(start),
+		"op": "set", "key": key, "size": len(value), "duration": time.Since(start),
 	}).Debug("redis set ok")
 	return nil
 }
 
-func (m *Model) mkdir(directory string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+// MkDir makes an empty directory visible by writing a placeholder leaf.
+func (m *Model) MkDir(ctx context.Context, dirKey string) error {
+	ctx, cancel := m.ctx(ctx)
 	defer cancel()
-	dir := normPath(directory)
-	if dir == "/" {
-		return nil
-	}
-	dir = strings.TrimSuffix(dir, "/")
-	markerKey := dir + "/" + dirMarker
-	pfx := withTrail(dir)
 
-	respKeys, err := m.scanKeysWithPrefix(ctx, pfx)
+	dirKey = strings.TrimSuffix(dirKey, "/")
+	if dirKey == "" {
+		return errors.New("cannot create the root directory")
+	}
+	existing, _, err := m.scan(ctx, PrefixOf(dirKey), 1)
 	if err != nil {
 		return err
 	}
-	if len(respKeys) > 0 {
-		// something already exists under this prefix, that's enough
+	if len(existing) > 0 {
+		// Something already lives under this prefix: the directory exists.
 		return nil
 	}
-	if err := m.rdb.Set(ctx, markerKey, "", 0).Err(); err != nil {
-		return err
-	}
-	return nil
+	return m.rdb.Set(ctx, dirKey+"/"+dirMarker, "", 0).Err()
 }
 
-func (m *Model) del(key string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+// Del removes a single key of any type.
+func (m *Model) Del(ctx context.Context, key string) error {
+	ctx, cancel := m.ctx(ctx)
 	defer cancel()
-	k := normPath(key)
-	if k == "/" {
-		return fmt.Errorf("cannot delete root")
+
+	key = strings.TrimSuffix(key, "/")
+	if key == "" {
+		return errors.New("cannot delete the root")
 	}
-	if _, err := m.rdb.Del(ctx, k).Result(); err != nil {
-		return err
-	}
-	return nil
+	return m.rdb.Del(ctx, key).Err()
 }
 
-func (m *Model) deldir(key string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+// DelDir recursively removes every key under a directory prefix.
+func (m *Model) DelDir(ctx context.Context, dirKey string) error {
+	ctx, cancel := m.ctx(ctx)
 	defer cancel()
-	pfx := withTrail(key)
-	keys, err := m.scanKeysWithPrefix(ctx, pfx)
+
+	prefix := PrefixOf(dirKey)
+	if prefix == "" {
+		return errors.New("refusing to delete the whole keyspace")
+	}
+	keys, _, err := m.scan(ctx, prefix, 0)
 	if err != nil {
 		return err
 	}
-	if len(keys) == 0 {
-		return nil
-	}
-	if _, err := m.rdb.Del(ctx, keys...).Result(); err != nil {
-		return err
+	return m.delBatched(ctx, m.withOwnKey(ctx, prefix, keys))
+}
+
+func (m *Model) delBatched(ctx context.Context, keys []string) error {
+	for i := 0; i < len(keys); i += delBatchSize {
+		end := i + delBatchSize
+		if end > len(keys) {
+			end = len(keys)
+		}
+		if err := m.rdb.Del(ctx, keys[i:end]...).Err(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-func (m *Model) renameDir(oldDir, newDir string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+// RenameDir moves every key under oldDirKey to newDirKey. RENAME is used so
+// that the type, the TTL and the exact value of each key survive the move.
+func (m *Model) RenameDir(ctx context.Context, oldDirKey, newDirKey string) error {
+	ctx, cancel := m.ctx(ctx)
 	defer cancel()
 
-	oldPfx := withTrail(oldDir)
-	newPfx := withTrail(newDir)
+	oldPfx := PrefixOf(oldDirKey)
+	newPfx := PrefixOf(newDirKey)
+	if oldPfx == "" || newPfx == "" {
+		return errors.New("cannot rename the root")
+	}
 	if oldPfx == newPfx {
 		return nil
 	}
+	if strings.HasPrefix(newPfx, oldPfx) {
+		return fmt.Errorf("cannot move %s into itself", PathOf(oldDirKey))
+	}
 
-	srcKeys, err := m.scanKeysWithPrefix(ctx, oldPfx)
+	srcKeys, _, err := m.scan(ctx, oldPfx, 0)
 	if err != nil {
 		return err
 	}
 	if len(srcKeys) == 0 {
-		return fmt.Errorf("source does not exist: %s", oldDir)
+		return fmt.Errorf("%w: %s", ErrNotFound, PathOf(oldDirKey))
 	}
-
-	// Check that target prefix is free
-	dstKeys, err := m.scanKeysWithPrefix(ctx, newPfx)
+	dstKeys, _, err := m.scan(ctx, newPfx, 1)
 	if err != nil {
 		return err
 	}
 	if len(dstKeys) > 0 {
-		return fmt.Errorf("target already exists: %s", newDir)
+		return fmt.Errorf("target already exists: %s", PathOf(newDirKey))
 	}
 
-	// Copy all keys
 	for _, oldKey := range srcKeys {
-		newKey := strings.Replace(oldKey, oldPfx, newPfx, 1)
-		val, err := m.rdb.Get(ctx, oldKey).Result()
-		if err != nil && err != redis.Nil {
-			return fmt.Errorf("copy %s -> %s get failed: %w", oldKey, newKey, err)
+		newKey := newPfx + strings.TrimPrefix(oldKey, oldPfx)
+		if err := m.rdb.Rename(ctx, oldKey, newKey).Err(); err != nil {
+			if errors.Is(err, redis.Nil) {
+				// Vanished mid-rename; nothing to move.
+				continue
+			}
+			return fmt.Errorf("rename %s -> %s: %w", PathOf(oldKey), PathOf(newKey), err)
 		}
-		if err := m.rdb.Set(ctx, newKey, val, 0).Err(); err != nil {
-			return fmt.Errorf("copy %s -> %s set failed: %w", oldKey, newKey, err)
-		}
-	}
-	// delete old prefix
-	if _, err := m.rdb.Del(ctx, srcKeys...).Result(); err != nil {
-		return err
 	}
 	return nil
-}
-
-func (m *Model) get(key string) (*Node, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	k := normPath(key)
-	if k == "/" {
-		// treat as dir
-		return &Node{
-			Name:  "/",
-			IsDir: true,
-			Value: "",
-		}, nil
-	}
-
-	val, err := m.rdb.Get(ctx, k).Result()
-	if err == nil {
-		return &Node{
-			Name:  k,
-			IsDir: false,
-			Value: val,
-		}, nil
-	}
-	if err != nil && err != redis.Nil {
-		// Same WRONGTYPE handling: non-string value.
-		if strings.Contains(err.Error(), "WRONGTYPE") {
-			// Treat as a non-string leaf; we don't have a value preview.
-			log.WithError(err).WithFields(log.Fields{
-				"op":  "get",
-				"key": k,
-			}).Debug("non-string Redis value in get; returning placeholder node")
-			return &Node{
-				Name:  k,
-				IsDir: false,
-				Value: "",
-			}, nil
-		}
-		return nil, err
-	}
-
-	// If no direct value, see if it behaves like a directory
-	pfx := withTrail(k)
-	keys, err := m.scanKeysWithPrefix(ctx, pfx)
-	if err != nil {
-		return nil, err
-	}
-	if len(keys) > 0 {
-		return &Node{
-			Name:  k,
-			IsDir: true,
-			Value: "",
-		}, nil
-	}
-
-	return nil, fmt.Errorf("not found: %s", k)
 }
